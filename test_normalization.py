@@ -1,0 +1,286 @@
+import ast
+import hashlib
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from datasets import load_dataset
+from jinja2 import Environment
+
+ROOT = Path(__file__).parent
+SCRIPT = ROOT / "gemma-4-31b-nvfp4-quantization.py"
+TEMPLATE = ROOT / "chat_template.jinja"
+TEMPLATE_SHA256 = "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
+SPEC = importlib.util.spec_from_file_location("quantization", SCRIPT)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader
+SPEC.loader.exec_module(MODULE)
+
+
+
+class Tests(unittest.TestCase):
+    def test_official_template_is_unchanged(self):
+        self.assertEqual(hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(), TEMPLATE_SHA256)
+
+    def test_config_and_template_selection(self):
+        class Tokenizer:
+            chat_template = "default"
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            (work_dir / "config.yaml").write_text(
+                "model_id: org/model\nsave_dir: output\n", encoding="utf-8"
+            )
+            model_id, save_dir = MODULE.load_config(work_dir)
+            self.assertEqual((model_id, save_dir), ("org/model", work_dir / "output"))
+
+            tokenizer = Tokenizer()
+            MODULE.apply_chat_template_file(tokenizer, work_dir)
+            self.assertEqual(tokenizer.chat_template, "default")
+            (work_dir / "chat_template.jinja").write_text("official", encoding="utf-8")
+            MODULE.apply_chat_template_file(tokenizer, work_dir)
+            self.assertEqual(tokenizer.chat_template, "official")
+
+    def test_hermes_sampling(self):
+        self.assertEqual(
+            MODULE.HERMES_SAMPLES,
+            {"single": 102, "multiturn": 154, "multistep": 205, "relevance": 51},
+        )
+        selected = MODULE.select_hermes_samples(
+            load_dataset(MODULE.HERMES_DATASET, split="train")
+        )
+
+        counts = {}
+        for category in selected["scenario_category"]:
+            counts[category] = counts.get(category, 0) + 1
+        self.assertEqual(counts, MODULE.HERMES_SAMPLES)
+        self.assertEqual(len(selected), 512)
+
+    def test_tool_schema_normalization(self):
+        tools = MODULE.normalize_tools(
+            json.dumps(
+                [
+                    {
+                        "name": "search",
+                        "parameters": {
+                            "count": {"type": "int"},
+                            "queries": {"type": "List[str]"},
+                        },
+                    }
+                ]
+            )
+        )
+        properties = tools[0]["function"]["parameters"]["properties"]
+        self.assertEqual(properties["count"]["type"], "integer")
+        self.assertEqual(
+            properties["queries"], {"type": "array", "items": {"type": "string"}}
+        )
+
+    def test_conversation_normalization(self):
+        messages = MODULE.normalize_conversation(
+            [
+                {
+                    "from": "system",
+                    "value": (
+                        "Keep this.\nYou are a function calling AI model. "
+                        "<tools>[]</tools>"
+                    ),
+                },
+                {"from": "human", "value": "Check Tokyo and Osaka"},
+                {
+                    "from": "gpt",
+                    "value": (
+                        "<think>Mention `<tool_call>` only as text.</think>"
+                        '<tool_call>{"name":"weather","arguments":{"city":"Tokyo"}}'
+                        "</tool_call>"
+                        '<tool_call>{"name":"weather","arguments":{"city":"Osaka"}}'
+                        "</tool_call>"
+                    ),
+                },
+                {
+                    "from": "tool",
+                    "value": (
+                        '<tool_response>{"tool_call_id":"tokyo","name":"weather",'
+                        '"content":{"temperature":28}}</tool_response>'
+                        '<tool_response>{"tool_call_id":"osaka","name":"weather",'
+                        '"content":{"temperature":29}}</tool_response>'
+                    ),
+                },
+                {
+                    "from": "gpt",
+                    "value": (
+                        '<tool_response>**{"tool_call_id":"duplicate","name":"weather",'
+                        '"content":{"temperature":29}}**</tool_response>'
+                    ),
+                },
+            ]
+        )
+        self.assertEqual([message["role"] for message in messages], [
+            "system", "user", "assistant", "assistant"
+        ])
+        self.assertEqual(messages[0]["content"], "Keep this.")
+        self.assertEqual(len(messages[2]["tool_calls"]), 2)
+        self.assertEqual(
+            messages[2]["tool_responses"],
+            [
+                {"name": "weather", "response": {"temperature": 28}},
+                {"name": "weather", "response": {"temperature": 29}},
+            ],
+        )
+        self.assertEqual(messages[3]["content"], "")
+
+    def test_response_edge_cases(self):
+        unwrapped = MODULE.normalize_conversation(
+            [
+                {
+                    "from": "gpt",
+                    "value": '<tool_call>{"name":"restaurant","arguments":{}}</tool_call>',
+                },
+                {
+                    "from": "tool",
+                    "value": (
+                        "<tool_response>{'name':'Bistro','distance':500}</tool_response>"
+                        "<tool_response>{'unrelated':true}</tool_response>"
+                    ),
+                },
+            ]
+        )
+        self.assertEqual(
+            unwrapped[0]["tool_responses"],
+            [{"name": "restaurant", "response": {"name": "Bistro", "distance": 500}}],
+        )
+
+        malformed = MODULE.normalize_conversation(
+            [
+                {
+                    "from": "gpt",
+                    "value": '<tool_call>{"name":"overview","arguments":{}}</tool_call>',
+                },
+                {
+                    "from": "tool",
+                    "value": (
+                        '<tool_response>{"name":"overview","content":"'
+                        "{'album': \"Quoted title\"}"
+                        '"}</tool_response>'
+                    ),
+                },
+            ]
+        )
+        self.assertEqual(malformed[0]["tool_responses"][0]["name"], "overview")
+        self.assertIsInstance(malformed[0]["tool_responses"][0]["response"], str)
+
+        orphan = MODULE.normalize_conversation(
+            [{"from": "gpt", "value": "<tool_response>Natural answer</tool_response>"}]
+        )
+        self.assertEqual(orphan, [{"role": "assistant", "content": "Natural answer"}])
+
+        invalid_call = MODULE.normalize_conversation([
+            {
+                "from": "gpt",
+                "value": '<tool_call>{"name":"broken","arguments":[}</tool_call>',
+            }
+        ])
+        self.assertEqual(
+            invalid_call,
+            [{"role": "assistant", "content": '{"name":"broken","arguments":[}'}],
+        )
+
+    def test_official_template_renders_normalized_data(self):
+        messages = MODULE.normalize_conversation(
+            [
+                {
+                    "from": "gpt",
+                    "value": '<tool_call>{"name":"weather","arguments":{}}</tool_call>',
+                },
+                {
+                    "from": "tool",
+                    "value": (
+                        '<tool_response>{"name":"weather","content":'
+                        '{"data":[{"temperature":28}]}}</tool_response>'
+                    ),
+                },
+            ]
+        )
+        rendered = Environment().from_string(TEMPLATE.read_text(encoding="utf-8")).render(
+            messages=messages,
+            tools=MODULE.normalize_tools('[{"name":"weather","parameters":{}}]'),
+            bos_token="<bos>",
+            add_generation_prompt=False,
+            preserve_thinking=True,
+            enable_thinking=False,
+        )
+        self.assertIn("<|tool_call>call:weather", rendered)
+        self.assertIn("<|tool_response>response:weather{data:[{temperature:28}]}", rendered)
+
+    def test_quantization_contract(self):
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+        def call_named(name):
+            return next(
+                call
+                for call in calls
+                if (isinstance(call.func, ast.Name) and call.func.id == name)
+                or (isinstance(call.func, ast.Attribute) and call.func.attr == name)
+            )
+
+        model_load = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute)
+            and ast.unparse(call.func.value) == "AutoModelForCausalLM"
+            and call.func.attr == "from_pretrained"
+        )
+        model_keywords = {item.arg: item.value for item in model_load.keywords}
+        self.assertEqual(model_keywords["dtype"].value, "auto")
+        self.assertEqual(model_keywords["device_map"].value, "auto")
+
+        template_calls = [
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute)
+            and call.func.attr == "apply_chat_template"
+        ]
+        self.assertEqual(len(template_calls), 2)
+        self.assertTrue(all(
+            {item.arg: item.value for item in call.keywords}["tokenize"].value is False
+            for call in template_calls
+        ))
+
+        recipe = call_named("QuantizationModifier")
+        recipe_keywords = {item.arg: item.value for item in recipe.keywords}
+        self.assertEqual(ast.literal_eval(recipe_keywords["targets"]), ["Linear"])
+        self.assertEqual(recipe_keywords["scheme"].value, "NVFP4")
+        self.assertEqual(
+            ast.literal_eval(recipe_keywords["ignore"]),
+            ["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*"],
+        )
+
+        oneshot = call_named("oneshot")
+        oneshot_keywords = {item.arg: item.value for item in oneshot.keywords}
+        self.assertEqual(ast.unparse(oneshot_keywords["tokenizer"]), "tokenizer")
+        self.assertEqual(oneshot_keywords["text_column"].value, "text")
+        self.assertEqual(oneshot_keywords["max_seq_length"].value, 8192)
+        self.assertIs(oneshot_keywords["shuffle_calibration_samples"].value, False)
+        self.assertIs(oneshot_keywords["pad_to_max_length"].value, False)
+        self.assertNotIn("data_collator", oneshot_keywords)
+
+        model_save = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute)
+            and ast.unparse(call.func.value) == "model"
+            and call.func.attr == "save_pretrained"
+        )
+        self.assertIs(
+            {item.arg: item.value for item in model_save.keywords}[
+                "save_compressed"
+            ].value,
+            True,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
