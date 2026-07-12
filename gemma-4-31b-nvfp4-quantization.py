@@ -33,17 +33,25 @@ LEGACY_TOOL_PROMPT = re.compile(
 GENERIC_ARRAY = re.compile(r"(?:list|array)\s*\[\s*(.+?)\s*\]", re.IGNORECASE)
 
 
-def load_config(work_dir: Path) -> tuple[str, Path]:
+def load_config(work_dir: Path) -> tuple[str, Path, bool]:
     config = yaml.safe_load((work_dir / "config.yaml").read_text(encoding="utf-8"))
     model_id = config["model_id"]
     save_dir = Path(config["save_dir"]).expanduser()
-    return model_id, save_dir if save_dir.is_absolute() else work_dir / save_dir
+    use_bundled_template = config["use_bundled_chat_template"]
+    if not isinstance(use_bundled_template, bool):
+        raise TypeError("use_bundled_chat_template must be true or false")
+    if not save_dir.is_absolute():
+        save_dir = work_dir / save_dir
+    return model_id, save_dir, use_bundled_template
 
 
-def apply_chat_template_file(tokenizer: Any, work_dir: Path) -> None:
-    path = work_dir / "chat_template.jinja"
-    if path.is_file():
-        tokenizer.chat_template = path.read_text(encoding="utf-8")
+def apply_chat_template_file(
+    tokenizer: Any, work_dir: Path, use_bundled_template: bool
+) -> None:
+    if use_bundled_template:
+        tokenizer.chat_template = (work_dir / "chat_template.jinja").read_text(
+            encoding="utf-8"
+        )
 
 
 def parse(value: Any) -> Any:
@@ -245,12 +253,12 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     work_dir = Path.cwd()
-    model_id, save_dir = load_config(work_dir)
+    model_id, save_dir, use_bundled_template = load_config(work_dir)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype="auto", device_map="auto"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    apply_chat_template_file(tokenizer, work_dir)
+    apply_chat_template_file(tokenizer, work_dir, use_bundled_template)
 
     aya = load_dataset(AYA_DATASET, split="train").shuffle(seed=SEED).select(
         range(SAMPLES_PER_DATASET)

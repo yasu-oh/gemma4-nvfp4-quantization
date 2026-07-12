@@ -1,2 +1,3 @@
 model_id: google/gemma-4-31B-it
 save_dir: gemma-4-31B-it-NVFP4
+use_bundled_chat_template: true

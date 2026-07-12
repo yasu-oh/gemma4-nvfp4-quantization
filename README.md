@@ -13,7 +13,7 @@ Calibration uses 1,024 chat-template-normalized samples:
   - `multistep`: 205
   - `relevance`: 51
 
-`chat_template.jinja` is the unmodified official Gemma template. Hermes data is normalized to its schema before rendering.
+`use_bundled_chat_template` in `config.yaml` selects the bundled, unmodified official Gemma template (`true`) or the model default (`false`). Hermes data is normalized before rendering.
 
 ## Usage
 ```bash
@@ -25,7 +25,7 @@ cd ~
 git clone https://github.com/yasu-oh/gemma-4-31b-nvfp4-quantization.git
 cd gemma-4-31b-nvfp4-quantization
 cp sample_config.yaml config.yaml
-# Set model_id to an original or derived Gemma 4 31B model, then edit save_dir.
+# Set model_id, save_dir, and use_bundled_chat_template.
 python gemma-4-31b-nvfp4-quantization.py
 ```
 

@@ -31,17 +31,35 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work_dir = Path(directory)
             (work_dir / "config.yaml").write_text(
-                "model_id: org/model\nsave_dir: output\n", encoding="utf-8"
+                "model_id: org/model\nsave_dir: output\nuse_bundled_chat_template: false\n",
+                encoding="utf-8",
             )
-            model_id, save_dir = MODULE.load_config(work_dir)
-            self.assertEqual((model_id, save_dir), ("org/model", work_dir / "output"))
+            model_id, save_dir, use_bundled_template = MODULE.load_config(work_dir)
+            self.assertEqual(
+                (model_id, save_dir, use_bundled_template),
+                ("org/model", work_dir / "output", False),
+            )
 
             tokenizer = Tokenizer()
-            MODULE.apply_chat_template_file(tokenizer, work_dir)
+            template_path = work_dir / "chat_template.jinja"
+            template_path.write_text("official", encoding="utf-8")
+            MODULE.apply_chat_template_file(tokenizer, work_dir, use_bundled_template)
             self.assertEqual(tokenizer.chat_template, "default")
-            (work_dir / "chat_template.jinja").write_text("official", encoding="utf-8")
-            MODULE.apply_chat_template_file(tokenizer, work_dir)
+
+            template_path.unlink()
+            with self.assertRaises(FileNotFoundError):
+                MODULE.apply_chat_template_file(tokenizer, work_dir, True)
+
+            template_path.write_text("official", encoding="utf-8")
+            MODULE.apply_chat_template_file(tokenizer, work_dir, True)
             self.assertEqual(tokenizer.chat_template, "official")
+
+            (work_dir / "config.yaml").write_text(
+                'model_id: org/model\nsave_dir: output\nuse_bundled_chat_template: "true"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(TypeError):
+                MODULE.load_config(work_dir)
 
     def test_hermes_sampling(self):
         self.assertEqual(
