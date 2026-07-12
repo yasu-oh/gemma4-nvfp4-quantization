@@ -33,6 +33,22 @@ LEGACY_TOOL_PROMPT = re.compile(
 GENERIC_ARRAY = re.compile(r"(?:list|array)\s*\[\s*(.+?)\s*\]", re.IGNORECASE)
 
 
+class InvalidToolDataError(ValueError):
+    pass
+
+
+class UnmatchedToolResponseError(InvalidToolDataError):
+    pass
+
+
+class InvalidToolCallError(InvalidToolDataError):
+    pass
+
+
+class InvalidToolResponseError(InvalidToolDataError):
+    pass
+
+
 def load_config(work_dir: Path) -> tuple[str, Path, bool]:
     config = yaml.safe_load((work_dir / "config.yaml").read_text(encoding="utf-8"))
     model_id = config["model_id"]
@@ -111,7 +127,9 @@ def normalize_tools(raw_tools: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def parse_assistant(value: str, turn: int) -> dict[str, Any]:
+def parse_assistant(
+    value: str, turn: int, *, reject_invalid_calls: bool = False
+) -> dict[str, Any]:
     reasoning = [text.strip() for text in THINK.findall(value) if text.strip()]
     visible = THINK.sub("", value)
     calls = []
@@ -123,6 +141,8 @@ def parse_assistant(value: str, turn: int) -> dict[str, Any]:
             if not isinstance(arguments, dict):
                 raise ValueError
         except (AttributeError, KeyError, SyntaxError, TypeError, ValueError):
+            if reject_invalid_calls:
+                raise InvalidToolCallError(raw_call)
             invalid_calls.append(raw_call.strip())
             continue
         calls.append(
@@ -148,13 +168,17 @@ def extract_string(payload: str, key: str) -> str | None:
     return json.loads(match.group(1)) if match else None
 
 
-def parse_response(value: str) -> dict[str, Any]:
+def parse_response(
+    value: str, *, reject_invalid: bool = False
+) -> dict[str, Any]:
     payload = value.strip()
     if payload.startswith("**") and payload.endswith("**"):
         payload = payload[2:-2].strip()
     try:
         response = parse(payload)
     except (SyntaxError, ValueError):
+        if reject_invalid:
+            raise InvalidToolResponseError(value)
         return {
             "content": value,
             "name": extract_string(value, "name"),
@@ -173,36 +197,71 @@ def attach_response(messages: list[dict[str, Any]], response: dict[str, Any]) ->
     content = response.get("content")
 
     for message in reversed(messages):
+        if any(
+            item["name"] == response_name and item["response"] == content
+            for item in message.get("tool_responses", [])
+        ):
+            return True
+
+    for message in reversed(messages):
         calls = message.get("tool_calls", [])
         if not calls:
             continue
         attached = message.setdefault("tool_responses", [])
-        used = {}
+        used: dict[str, int] = {}
         for item in attached:
             used[item["name"]] = used.get(item["name"], 0) + 1
-        seen = {}
+        seen: dict[str, int] = {}
+        pending = []
         for call in calls:
             name = call["function"]["name"]
             seen[name] = seen.get(name, 0) + 1
-            if response_name and name != response_name:
-                continue
-            if seen[name] <= used.get(name, 0):
-                continue
-            if response_id:
-                call["id"] = response_id
-            attached.append({"name": name, "response": content})
-            return True
-        if response_id and any(call["id"] == response_id for call in calls):
-            return True
-        if any(
-            item["name"] == response_name and item["response"] == content
-            for item in attached
-        ):
-            return True
+            if seen[name] > used.get(name, 0):
+                pending.append(call)
+
+        if not pending:
+            continue
+
+        call = next(
+            (
+                item
+                for item in pending
+                if response_id
+                and item["id"] == response_id
+                and (
+                    not response_name
+                    or item["function"]["name"] == response_name
+                )
+            ),
+            None,
+        )
+        if call is None:
+            call = next(
+                (
+                    item
+                    for item in pending
+                    if response_name
+                    and item["function"]["name"] == response_name
+                ),
+                None,
+            )
+        if call is None and not response_name and len(pending) == 1:
+            call = pending[0]
+        if call is None:
+            return False
+
+        if response_id:
+            call["id"] = response_id
+        attached.append(
+            {"name": call["function"]["name"], "response": content}
+        )
+        return True
     return False
 
 
-def normalize_conversation(conversation: Any) -> list[dict[str, Any]]:
+def normalize_conversation(
+    conversation: Any, *, strict_tool_data: bool = False
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for turn_index, turn in enumerate(conversation):
         role, value = turn["from"], turn.get("value", "")
@@ -213,11 +272,21 @@ def normalize_conversation(conversation: Any) -> list[dict[str, Any]]:
         elif role == "human":
             messages.append({"role": "user", "content": value.strip()})
         elif role == "gpt":
-            assistant = parse_assistant(value, turn_index)
+            assistant = parse_assistant(
+                value,
+                turn_index,
+                reject_invalid_calls=strict_tool_data,
+            )
             messages.append(assistant)
             for raw_response in TOOL_RESPONSE.findall(THINK.sub("", value)):
-                response = parse_response(raw_response)
+                response = parse_response(
+                    raw_response, reject_invalid=strict_tool_data
+                )
                 if not attach_response(messages, response):
+                    if strict_tool_data and (
+                        response.get("name") or response.get("tool_call_id")
+                    ):
+                        raise UnmatchedToolResponseError(raw_response)
                     fallback = str(response.get("content") or "").strip("* \n")
                     assistant["content"] = "\n\n".join(
                         part
@@ -226,15 +295,31 @@ def normalize_conversation(conversation: Any) -> list[dict[str, Any]]:
                     )
         elif role == "tool":
             for raw_response in TOOL_RESPONSE.findall(value) or [value]:
-                attach_response(messages, parse_response(raw_response))
+                response = parse_response(
+                    raw_response, reject_invalid=strict_tool_data
+                )
+                if not attach_response(messages, response):
+                    if strict_tool_data:
+                        raise UnmatchedToolResponseError(raw_response)
         else:
             raise ValueError(f"Unsupported role: {role}")
     return messages
 
 
+def has_consistent_tool_data(conversation: Any) -> bool:
+    try:
+        normalize_conversation(conversation, strict_tool_data=True)
+    except InvalidToolDataError:
+        return False
+    return True
+
+
 def select_hermes_samples(dataset: Any) -> Any:
     from datasets import concatenate_datasets
 
+    dataset = dataset.filter(
+        lambda row: has_consistent_tool_data(row["conversations"])
+    )
     subsets = []
     for category, count in HERMES_SAMPLES.items():
         subset = dataset.filter(
@@ -280,7 +365,9 @@ def main() -> None:
     def format_hermes(row: dict[str, Any]) -> dict[str, str]:
         return {
             "text": tokenizer.apply_chat_template(
-                normalize_conversation(row["conversations"]),
+                normalize_conversation(
+                    row["conversations"], strict_tool_data=True
+                ),
                 tools=normalize_tools(row["tools"]),
                 tokenize=False,
                 add_generation_prompt=False,

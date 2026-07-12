@@ -8,6 +8,7 @@ from pathlib import Path
 
 from datasets import load_dataset
 from jinja2 import Environment
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).parent
 SCRIPT = ROOT / "gemma-4-31b-nvfp4-quantization.py"
@@ -18,6 +19,9 @@ MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
 SPEC.loader.exec_module(MODULE)
 
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 class Tests(unittest.TestCase):
@@ -62,6 +66,40 @@ class Tests(unittest.TestCase):
                 MODULE.load_config(work_dir)
 
     def test_hermes_sampling(self):
+        mismatched = [
+            {
+                "from": "gpt",
+                "value": (
+                    '<tool_call>{"id":"shared","name":"expected",'
+                    '"arguments":{}}</tool_call>'
+                ),
+            },
+            {
+                "from": "tool",
+                "value": (
+                    '<tool_response>{"tool_call_id":"shared","name":"wrong",'
+                    '"content":{"ok":true}}</tool_response>'
+                ),
+            },
+        ]
+        self.assertFalse(MODULE.has_consistent_tool_data(mismatched))
+        with self.assertRaises(MODULE.UnmatchedToolResponseError):
+            MODULE.normalize_conversation(
+                mismatched, strict_tool_data=True
+            )
+
+        ambiguous = [
+            {
+                "from": "gpt",
+                "value": (
+                    '<tool_call>{"name":"first","arguments":{}}</tool_call>'
+                    '<tool_call>{"name":"second","arguments":{}}</tool_call>'
+                ),
+            },
+            {"from": "tool", "value": '{"content":{"ok":true}}'},
+        ]
+        self.assertFalse(MODULE.has_consistent_tool_data(ambiguous))
+
         self.assertEqual(
             MODULE.HERMES_SAMPLES,
             {"single": 102, "multiturn": 154, "multistep": 205, "relevance": 51},
@@ -75,6 +113,72 @@ class Tests(unittest.TestCase):
             counts[category] = counts.get(category, 0) + 1
         self.assertEqual(counts, MODULE.HERMES_SAMPLES)
         self.assertEqual(len(selected), 512)
+
+        tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
+        MODULE.apply_chat_template_file(tokenizer, ROOT, True)
+        template_hash = hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
+
+        for index, row in enumerate(selected):
+            with self.subTest(index=index, category=row["scenario_category"]):
+                self.assertTrue(
+                    MODULE.has_consistent_tool_data(row["conversations"])
+                )
+                messages = MODULE.normalize_conversation(
+                    row["conversations"], strict_tool_data=True
+                )
+                tools = MODULE.normalize_tools(row["tools"])
+
+                expected_responses = []
+                for turn in row["conversations"]:
+                    visible = MODULE.THINK.sub("", str(turn.get("value", "")))
+                    raw_responses = MODULE.TOOL_RESPONSE.findall(visible)
+                    if turn["from"] == "tool" and not raw_responses:
+                        raw_responses = [visible]
+                    for raw_response in raw_responses:
+                        response = MODULE.parse_response(raw_response)
+                        if turn["from"] == "tool" or response.get(
+                            "name"
+                        ) or response.get("tool_call_id"):
+                            expected_responses.append(
+                                canonical(response.get("content"))
+                            )
+
+                actual_responses = [
+                    response
+                    for message in messages
+                    for response in message.get("tool_responses", [])
+                ]
+                actual_payloads = {
+                    canonical(response["response"])
+                    for response in actual_responses
+                }
+                for expected in expected_responses:
+                    self.assertIn(expected, actual_payloads)
+
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    tools=tools,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    preserve_thinking=True,
+                )
+                self.assertTrue(rendered)
+                self.assertEqual(
+                    rendered.count("<|tool_response>response:"), len(actual_responses)
+                )
+                for response in actual_responses:
+                    self.assertIn(
+                        f'<|tool_response>response:{response["name"]}', rendered
+                    )
+                self.assertLessEqual(
+                    len(tokenizer.encode(rendered, add_special_tokens=False)),
+                    8192,
+                )
+
+        self.assertEqual(
+            hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(), template_hash
+        )
+        self.assertEqual(template_hash, TEMPLATE_SHA256)
 
     def test_tool_schema_normalization(self):
         tools = MODULE.normalize_tools(
@@ -170,40 +274,42 @@ class Tests(unittest.TestCase):
             [{"name": "restaurant", "response": {"name": "Bistro", "distance": 500}}],
         )
 
-        malformed = MODULE.normalize_conversation(
-            [
-                {
-                    "from": "gpt",
-                    "value": '<tool_call>{"name":"overview","arguments":{}}</tool_call>',
-                },
-                {
-                    "from": "tool",
-                    "value": (
-                        '<tool_response>{"name":"overview","content":"'
-                        "{'album': \"Quoted title\"}"
-                        '"}</tool_response>'
-                    ),
-                },
-            ]
-        )
+        malformed_conversation = [
+            {
+                "from": "gpt",
+                "value": '<tool_call>{"name":"overview","arguments":{}}</tool_call>',
+            },
+            {
+                "from": "tool",
+                "value": (
+                    '<tool_response>{"name":"overview","content":"'
+                    "{'album': \"Quoted title\"}"
+                    '"}</tool_response>'
+                ),
+            },
+        ]
+        malformed = MODULE.normalize_conversation(malformed_conversation)
         self.assertEqual(malformed[0]["tool_responses"][0]["name"], "overview")
         self.assertIsInstance(malformed[0]["tool_responses"][0]["response"], str)
+        self.assertFalse(MODULE.has_consistent_tool_data(malformed_conversation))
 
         orphan = MODULE.normalize_conversation(
             [{"from": "gpt", "value": "<tool_response>Natural answer</tool_response>"}]
         )
         self.assertEqual(orphan, [{"role": "assistant", "content": "Natural answer"}])
 
-        invalid_call = MODULE.normalize_conversation([
+        invalid_call_conversation = [
             {
                 "from": "gpt",
                 "value": '<tool_call>{"name":"broken","arguments":[}</tool_call>',
             }
-        ])
+        ]
+        invalid_call = MODULE.normalize_conversation(invalid_call_conversation)
         self.assertEqual(
             invalid_call,
             [{"role": "assistant", "content": '{"name":"broken","arguments":[}'}],
         )
+        self.assertFalse(MODULE.has_consistent_tool_data(invalid_call_conversation))
 
     def test_official_template_renders_normalized_data(self):
         messages = MODULE.normalize_conversation(

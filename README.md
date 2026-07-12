@@ -13,7 +13,7 @@ Calibration uses 1,024 chat-template-normalized samples:
   - `multistep`: 205
   - `relevance`: 51
 
-`use_bundled_chat_template` in `config.yaml` selects the bundled, unmodified official Gemma template (`true`) or the model default (`false`). Hermes data is normalized before rendering.
+`use_bundled_chat_template` in `config.yaml` selects the bundled, unmodified official Gemma template (`true`) or the model default (`false`). Hermes rows with unmatched tool responses are excluded before stratified sampling, then normalized before rendering.
 
 ## Usage
 ```bash
