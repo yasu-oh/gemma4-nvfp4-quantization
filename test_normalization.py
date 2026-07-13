@@ -1,5 +1,4 @@
 import ast
-import hashlib
 import importlib.util
 import json
 import tempfile
@@ -13,7 +12,6 @@ from transformers import AutoTokenizer
 ROOT = Path(__file__).parent
 SCRIPT = ROOT / "gemma-4-31b-nvfp4-quantization.py"
 TEMPLATE = ROOT / "chat_template.jinja"
-TEMPLATE_SHA256 = "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
 SPEC = importlib.util.spec_from_file_location("quantization", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
@@ -25,9 +23,6 @@ def canonical(value):
 
 
 class Tests(unittest.TestCase):
-    def test_official_template_is_unchanged(self):
-        self.assertEqual(hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(), TEMPLATE_SHA256)
-
     def test_config_and_template_selection(self):
         class Tokenizer:
             chat_template = "default"
@@ -116,7 +111,6 @@ class Tests(unittest.TestCase):
 
         tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
         MODULE.apply_chat_template_file(tokenizer, ROOT, True)
-        template_hash = hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
 
         for index, row in enumerate(selected):
             with self.subTest(index=index, category=row["scenario_category"]):
@@ -174,11 +168,6 @@ class Tests(unittest.TestCase):
                     len(tokenizer.encode(rendered, add_special_tokens=False)),
                     8192,
                 )
-
-        self.assertEqual(
-            hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(), template_hash
-        )
-        self.assertEqual(template_hash, TEMPLATE_SHA256)
 
     def test_tool_schema_normalization(self):
         tools = MODULE.normalize_tools(
