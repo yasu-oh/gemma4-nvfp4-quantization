@@ -336,6 +336,7 @@ def main() -> None:
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import QuantizationModifier
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from compressed_tensors.quantization import QuantizationArgs
 
     work_dir = Path.cwd()
     model_id, save_dir, use_bundled_template = load_config(work_dir)
@@ -386,6 +387,14 @@ def main() -> None:
         targets=["Linear"],
         scheme="NVFP4",
         ignore=["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*"],
+        kv_cache_scheme=QuantizationArgs(
+            num_bits=8,
+            type="float",
+            symmetric=True,
+            strategy="tensor",
+            dynamic=False,
+            observer="static_minmax",
+        ),
     )
     oneshot(
         model=model,
