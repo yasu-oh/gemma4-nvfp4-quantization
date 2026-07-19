@@ -368,7 +368,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(recipe_keywords["scheme"].value, "NVFP4")
         self.assertEqual(
             ast.literal_eval(recipe_keywords["ignore"]),
-            ["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*"],
+            ["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"],
         )
 
         oneshot = call_named("oneshot")

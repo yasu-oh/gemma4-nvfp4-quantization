@@ -386,7 +386,7 @@ def main() -> None:
     recipe = QuantizationModifier(
         targets=["Linear"],
         scheme="NVFP4",
-        ignore=["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*"],
+        ignore=["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"],
         kv_cache_scheme=QuantizationArgs(
             num_bits=8,
             type="float",
