@@ -30,13 +30,14 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work_dir = Path(directory)
             (work_dir / "config.yaml").write_text(
-                "model_id: org/model\nsave_dir: output\nuse_bundled_chat_template: false\n",
+                "model_id: org/model\ndevice_map: cpu\nsave_dir: output\n"
+                "use_bundled_chat_template: false\n",
                 encoding="utf-8",
             )
-            model_id, save_dir, use_bundled_template = MODULE.load_config(work_dir)
+            model_id, device_map, save_dir, use_bundled_template = MODULE.load_config(work_dir)
             self.assertEqual(
-                (model_id, save_dir, use_bundled_template),
-                ("org/model", work_dir / "output", False),
+                (model_id, device_map, save_dir, use_bundled_template),
+                ("org/model", "cpu", work_dir / "output", False),
             )
 
             tokenizer = Tokenizer()
@@ -54,7 +55,20 @@ class Tests(unittest.TestCase):
             self.assertEqual(tokenizer.chat_template, "official")
 
             (work_dir / "config.yaml").write_text(
-                'model_id: org/model\nsave_dir: output\nuse_bundled_chat_template: "true"\n',
+                "model_id: org/model\ndevice_map:\n  model.embed_tokens: cpu\n"
+                "  model.layers.0: 0\nsave_dir: output\n"
+                "use_bundled_chat_template: false\n",
+                encoding="utf-8",
+            )
+            _, device_map, _, _ = MODULE.load_config(work_dir)
+            self.assertEqual(
+                device_map,
+                {"model.embed_tokens": "cpu", "model.layers.0": 0},
+            )
+
+            (work_dir / "config.yaml").write_text(
+                'model_id: org/model\ndevice_map: auto\nsave_dir: output\n'
+                'use_bundled_chat_template: "true"\n',
                 encoding="utf-8",
             )
             with self.assertRaises(TypeError):
@@ -348,7 +362,7 @@ class Tests(unittest.TestCase):
         )
         model_keywords = {item.arg: item.value for item in model_load.keywords}
         self.assertEqual(model_keywords["dtype"].value, "auto")
-        self.assertEqual(model_keywords["device_map"].value, "auto")
+        self.assertEqual(ast.unparse(model_keywords["device_map"]), "device_map")
 
         template_calls = [
             call

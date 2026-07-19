@@ -25,7 +25,7 @@ cd ~
 git clone https://github.com/yasu-oh/gemma-4-31b-nvfp4-quantization.git
 cd gemma-4-31b-nvfp4-quantization
 cp sample_config.yaml config.yaml
-# Set model_id, save_dir, and use_bundled_chat_template.
+# Set model_id, device_map, save_dir, and use_bundled_chat_template.
 python gemma-4-31b-nvfp4-quantization.py
 ```
 
