@@ -10,7 +10,7 @@ from jinja2 import Environment
 from transformers import AutoTokenizer
 
 ROOT = Path(__file__).parent
-SCRIPT = ROOT / "gemma-4-31b-nvfp4-quantization.py"
+SCRIPT = ROOT / "gemma4-nvfp4-quantization.py"
 TEMPLATE = ROOT / "chat_template.jinja"
 SPEC = importlib.util.spec_from_file_location("quantization", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
