@@ -376,13 +376,86 @@ class Tests(unittest.TestCase):
             for call in template_calls
         ))
 
-        recipe = call_named("QuantizationModifier")
-        recipe_keywords = {item.arg: item.value for item in recipe.keywords}
-        self.assertEqual(ast.literal_eval(recipe_keywords["targets"]), ["Linear"])
-        self.assertEqual(recipe_keywords["scheme"].value, "NVFP4")
+        assignments = {
+            target.id: node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance((target := node.targets[0]), ast.Name)
+        }
         self.assertEqual(
-            ast.literal_eval(recipe_keywords["ignore"]),
-            ["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"],
+            ast.literal_eval(assignments["ignore"]),
+            [
+                "re:.*vision.*",
+                "re:.*audio.*",
+                "lm_head",
+                "re:.*embed.*",
+                "re:.*router.*",
+            ],
+        )
+
+        preset = call_named("preset_name_to_scheme")
+        self.assertEqual(ast.literal_eval(preset.args[0]), "NVFP4")
+        self.assertEqual(ast.literal_eval(preset.args[1]), ["Linear"])
+
+        attribute_assignments = {
+            ast.unparse(node.targets[0]): node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+        }
+        self.assertEqual(
+            ast.literal_eval(attribute_assignments["nvfp4_scheme.weights.observer"]),
+            "imatrix_mse",
+        )
+        self.assertEqual(
+            ast.literal_eval(
+                attribute_assignments["nvfp4_scheme.weights.observer_kwargs"]
+            ),
+            {"strict": True},
+        )
+
+        recipe = assignments["recipe"]
+        self.assertIsInstance(recipe, ast.List)
+        self.assertEqual(
+            [ast.unparse(item.func) for item in recipe.elts],
+            ["IMatrixGatherer", "QuantizationModifier"],
+        )
+
+        gatherer_keywords = {
+            item.arg: item.value for item in recipe.elts[0].keywords
+        }
+        self.assertEqual(ast.literal_eval(gatherer_keywords["targets"]), ["Linear"])
+        self.assertEqual(ast.unparse(gatherer_keywords["ignore"]), "ignore")
+
+        modifier_keywords = {
+            item.arg: item.value for item in recipe.elts[1].keywords
+        }
+        config_groups = modifier_keywords["config_groups"]
+        self.assertEqual(
+            [ast.literal_eval(key) for key in config_groups.keys], ["group_0"]
+        )
+        self.assertEqual(
+            [ast.unparse(value) for value in config_groups.values], ["nvfp4_scheme"]
+        )
+        self.assertEqual(ast.unparse(modifier_keywords["ignore"]), "ignore")
+
+        kv_cache_scheme = modifier_keywords["kv_cache_scheme"]
+        self.assertEqual(ast.unparse(kv_cache_scheme.func), "QuantizationArgs")
+        self.assertEqual(
+            {
+                item.arg: ast.literal_eval(item.value)
+                for item in kv_cache_scheme.keywords
+            },
+            {
+                "num_bits": 8,
+                "type": "float",
+                "symmetric": True,
+                "strategy": "tensor",
+                "dynamic": False,
+                "observer": "static_minmax",
+            },
         )
 
         oneshot = call_named("oneshot")
