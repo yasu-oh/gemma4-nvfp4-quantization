@@ -336,8 +336,9 @@ def main() -> None:
     from datasets import concatenate_datasets, load_dataset
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from compressed_tensors.quantization import QuantizationArgs
+    from compressed_tensors.quantization import QuantizationArgs, preset_name_to_scheme
 
     work_dir = Path.cwd()
     model_id, device_map, save_dir, use_bundled_template = load_config(work_dir)
@@ -384,19 +385,37 @@ def main() -> None:
         ]
     ).shuffle(seed=SEED)
 
-    recipe = QuantizationModifier(
-        targets=["Linear"],
-        scheme="NVFP4",
-        ignore=["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"],
-        kv_cache_scheme=QuantizationArgs(
-            num_bits=8,
-            type="float",
-            symmetric=True,
-            strategy="tensor",
-            dynamic=False,
-            observer="static_minmax",
+    ignore=["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"]
+
+    nvfp4_scheme = preset_name_to_scheme("NVFP4", ["Linear"])
+
+    if nvfp4_scheme.weights is None:
+        raise RuntimeError("NVFP4 preset does not define weight quantization")
+
+    nvfp4_scheme.weights.observer = "imatrix_mse"
+    nvfp4_scheme.weights.observer_kwargs = {"strict": True}
+
+    recipe = [
+        IMatrixGatherer(
+            targets=["Linear"],
+            ignore=ignore,
         ),
-    )
+        QuantizationModifier(
+            config_groups={
+                "group_0": nvfp4_scheme,
+            },
+            ignore=ignore,
+            kv_cache_scheme=QuantizationArgs(
+                num_bits=8,
+                type="float",
+                symmetric=True,
+                strategy="tensor",
+                dynamic=False,
+                observer="static_minmax",
+            ),
+        ),
+    ]
+
     oneshot(
         model=model,
         tokenizer=tokenizer,
