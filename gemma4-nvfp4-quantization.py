@@ -385,7 +385,7 @@ def main() -> None:
         ]
     ).shuffle(seed=SEED)
 
-    ignore=["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"]
+    ignore = ["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"]
 
     nvfp4_scheme = preset_name_to_scheme("NVFP4", ["Linear"])
 
