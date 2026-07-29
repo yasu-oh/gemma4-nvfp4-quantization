@@ -336,7 +336,6 @@ def main() -> None:
     from datasets import concatenate_datasets, load_dataset
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import QuantizationModifier
-    from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from compressed_tensors.quantization import QuantizationArgs, preset_name_to_scheme
 
@@ -396,10 +395,6 @@ def main() -> None:
     nvfp4_scheme.weights.observer_kwargs = {"strict": True}
 
     recipe = [
-        IMatrixGatherer(
-            targets=["Linear"],
-            ignore=ignore,
-        ),
         QuantizationModifier(
             config_groups={
                 "group_0": nvfp4_scheme,

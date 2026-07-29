@@ -416,21 +416,23 @@ class Tests(unittest.TestCase):
             {"strict": True},
         )
 
+        self.assertFalse(
+            any(
+                isinstance(node, ast.ImportFrom)
+                and node.module == "llmcompressor.modifiers.transform.imatrix"
+                for node in ast.walk(tree)
+            )
+        )
+
         recipe = assignments["recipe"]
         self.assertIsInstance(recipe, ast.List)
         self.assertEqual(
             [ast.unparse(item.func) for item in recipe.elts],
-            ["IMatrixGatherer", "QuantizationModifier"],
+            ["QuantizationModifier"],
         )
 
-        gatherer_keywords = {
-            item.arg: item.value for item in recipe.elts[0].keywords
-        }
-        self.assertEqual(ast.literal_eval(gatherer_keywords["targets"]), ["Linear"])
-        self.assertEqual(ast.unparse(gatherer_keywords["ignore"]), "ignore")
-
         modifier_keywords = {
-            item.arg: item.value for item in recipe.elts[1].keywords
+            item.arg: item.value for item in recipe.elts[0].keywords
         }
         config_groups = modifier_keywords["config_groups"]
         self.assertEqual(
