@@ -335,7 +335,7 @@ def select_hermes_samples(dataset: Any) -> Any:
 def main() -> None:
     from datasets import concatenate_datasets, load_dataset
     from llmcompressor import oneshot
-    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.modifiers.quantization import GPTQModifier
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from compressed_tensors.quantization import QuantizationArgs, preset_name_to_scheme
 
@@ -384,7 +384,14 @@ def main() -> None:
         ]
     ).shuffle(seed=SEED)
 
-    ignore = ["re:.*vision.*", "re:.*audio.*", "lm_head", "re:.*embed.*", "re:.*router.*"]
+    ignore = [
+        "lm_head",
+        "re:.*embed.*",
+        "re:.*vision.*",
+        "re:.*audio.*",
+        "re:.*router.*",
+        "re:.*per_layer.*",
+        ]
 
     nvfp4_scheme = preset_name_to_scheme("NVFP4", ["Linear"])
 
@@ -395,7 +402,7 @@ def main() -> None:
     nvfp4_scheme.weights.observer_kwargs = {"strict": True}
 
     recipe = [
-        QuantizationModifier(
+        GPTQModifier(
             config_groups={
                 "group_0": nvfp4_scheme,
             },

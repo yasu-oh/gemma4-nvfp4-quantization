@@ -386,11 +386,12 @@ class Tests(unittest.TestCase):
         self.assertEqual(
             ast.literal_eval(assignments["ignore"]),
             [
-                "re:.*vision.*",
-                "re:.*audio.*",
                 "lm_head",
                 "re:.*embed.*",
+                "re:.*vision.*",
+                "re:.*audio.*",
                 "re:.*router.*",
+                "re:.*per_layer.*",
             ],
         )
 
@@ -428,7 +429,7 @@ class Tests(unittest.TestCase):
         self.assertIsInstance(recipe, ast.List)
         self.assertEqual(
             [ast.unparse(item.func) for item in recipe.elts],
-            ["QuantizationModifier"],
+            ["GPTQModifier"],
         )
 
         modifier_keywords = {
