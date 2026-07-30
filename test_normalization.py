@@ -34,10 +34,12 @@ class Tests(unittest.TestCase):
                 "use_bundled_chat_template: false\n",
                 encoding="utf-8",
             )
-            model_id, device_map, save_dir, use_bundled_template = MODULE.load_config(work_dir)
+            model_id, device_map, save_dir, use_bundled_template, pipeline = (
+                MODULE.load_config(work_dir)
+            )
             self.assertEqual(
-                (model_id, device_map, save_dir, use_bundled_template),
-                ("org/model", "cpu", work_dir / "output", False),
+                (model_id, device_map, save_dir, use_bundled_template, pipeline),
+                ("org/model", "cpu", work_dir / "output", False, "sequential"),
             )
 
             tokenizer = Tokenizer()
@@ -60,11 +62,27 @@ class Tests(unittest.TestCase):
                 "use_bundled_chat_template: false\n",
                 encoding="utf-8",
             )
-            _, device_map, _, _ = MODULE.load_config(work_dir)
+            _, device_map, _, _, pipeline = MODULE.load_config(work_dir)
             self.assertEqual(
                 device_map,
                 {"model.embed_tokens": "cpu", "model.layers.0": 0},
             )
+            self.assertEqual(pipeline, "sequential")
+
+            (work_dir / "config.yaml").write_text(
+                "model_id: org/model\ndevice_map: auto\nsave_dir: output\n"
+                "use_bundled_chat_template: false\npipeline: basic\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(MODULE.load_config(work_dir)[4], "basic")
+
+            (work_dir / "config.yaml").write_text(
+                "model_id: org/model\ndevice_map: auto\nsave_dir: output\n"
+                "use_bundled_chat_template: false\npipeline: invalid\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                MODULE.load_config(work_dir)
 
             (work_dir / "config.yaml").write_text(
                 'model_id: org/model\ndevice_map: auto\nsave_dir: output\n'
@@ -464,6 +482,7 @@ class Tests(unittest.TestCase):
         oneshot = call_named("oneshot")
         oneshot_keywords = {item.arg: item.value for item in oneshot.keywords}
         self.assertEqual(ast.unparse(oneshot_keywords["tokenizer"]), "tokenizer")
+        self.assertEqual(ast.unparse(oneshot_keywords["pipeline"]), "pipeline")
         self.assertEqual(oneshot_keywords["text_column"].value, "text")
         self.assertEqual(oneshot_keywords["max_seq_length"].value, 8192)
         self.assertIs(oneshot_keywords["shuffle_calibration_samples"].value, False)

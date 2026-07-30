@@ -19,6 +19,7 @@ HERMES_SAMPLES = {
 }
 SAMPLES_PER_DATASET = 512
 SEED = 42
+PIPELINES = {"basic", "datafree", "independent", "sequential"}
 
 THINK = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
 TOOL_CALL = re.compile(
@@ -49,17 +50,20 @@ class InvalidToolResponseError(InvalidToolDataError):
     pass
 
 
-def load_config(work_dir: Path) -> tuple[str, Any, Path, bool]:
+def load_config(work_dir: Path) -> tuple[str, Any, Path, bool, str]:
     config = yaml.safe_load((work_dir / "config.yaml").read_text(encoding="utf-8"))
     model_id = config["model_id"]
     device_map = config["device_map"]
     save_dir = Path(config["save_dir"]).expanduser()
     use_bundled_template = config["use_bundled_chat_template"]
+    pipeline = config.get("pipeline", "sequential")
     if not isinstance(use_bundled_template, bool):
         raise TypeError("use_bundled_chat_template must be true or false")
+    if pipeline not in PIPELINES:
+        raise ValueError(f"pipeline must be one of {sorted(PIPELINES)}")
     if not save_dir.is_absolute():
         save_dir = work_dir / save_dir
-    return model_id, device_map, save_dir, use_bundled_template
+    return model_id, device_map, save_dir, use_bundled_template, pipeline
 
 
 def apply_chat_template_file(
@@ -340,7 +344,9 @@ def main() -> None:
     from compressed_tensors.quantization import QuantizationArgs, preset_name_to_scheme
 
     work_dir = Path.cwd()
-    model_id, device_map, save_dir, use_bundled_template = load_config(work_dir)
+    model_id, device_map, save_dir, use_bundled_template, pipeline = load_config(
+        work_dir
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype="auto", device_map=device_map
     )
@@ -421,6 +427,7 @@ def main() -> None:
     oneshot(
         model=model,
         tokenizer=tokenizer,
+        pipeline=pipeline,
         recipe=recipe,
         dataset=calibration_dataset,
         num_calibration_samples=SAMPLES_PER_DATASET * 2,
