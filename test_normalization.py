@@ -11,11 +11,18 @@ from transformers import AutoTokenizer
 
 ROOT = Path(__file__).parent
 SCRIPT = ROOT / "gemma4-nvfp4-quantization.py"
+DATASET_SCRIPT = ROOT / "calibration_dataset.py"
 TEMPLATE = ROOT / "chat_template.jinja"
 SPEC = importlib.util.spec_from_file_location("quantization", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
 SPEC.loader.exec_module(MODULE)
+DATASET_SPEC = importlib.util.spec_from_file_location(
+    "calibration_dataset_under_test", DATASET_SCRIPT
+)
+DATASET = importlib.util.module_from_spec(DATASET_SPEC)
+assert DATASET_SPEC.loader
+DATASET_SPEC.loader.exec_module(DATASET)
 
 
 def canonical(value):
@@ -109,9 +116,9 @@ class Tests(unittest.TestCase):
                 ),
             },
         ]
-        self.assertFalse(MODULE.has_consistent_tool_data(mismatched))
-        with self.assertRaises(MODULE.UnmatchedToolResponseError):
-            MODULE.normalize_conversation(
+        self.assertFalse(DATASET.has_consistent_tool_data(mismatched))
+        with self.assertRaises(DATASET.UnmatchedToolResponseError):
+            DATASET.normalize_conversation(
                 mismatched, strict_tool_data=True
             )
 
@@ -125,20 +132,20 @@ class Tests(unittest.TestCase):
             },
             {"from": "tool", "value": '{"content":{"ok":true}}'},
         ]
-        self.assertFalse(MODULE.has_consistent_tool_data(ambiguous))
+        self.assertFalse(DATASET.has_consistent_tool_data(ambiguous))
 
         self.assertEqual(
-            MODULE.HERMES_SAMPLES,
+            DATASET.HERMES_SAMPLES,
             {"single": 102, "multiturn": 154, "multistep": 205, "relevance": 51},
         )
-        selected = MODULE.select_hermes_samples(
-            load_dataset(MODULE.HERMES_DATASET, split="train")
+        selected = DATASET.select_hermes_samples(
+            load_dataset(DATASET.HERMES_DATASET, split="train")
         )
 
         counts = {}
         for category in selected["scenario_category"]:
             counts[category] = counts.get(category, 0) + 1
-        self.assertEqual(counts, MODULE.HERMES_SAMPLES)
+        self.assertEqual(counts, DATASET.HERMES_SAMPLES)
         self.assertEqual(len(selected), 512)
 
         tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
@@ -147,21 +154,21 @@ class Tests(unittest.TestCase):
         for index, row in enumerate(selected):
             with self.subTest(index=index, category=row["scenario_category"]):
                 self.assertTrue(
-                    MODULE.has_consistent_tool_data(row["conversations"])
+                    DATASET.has_consistent_tool_data(row["conversations"])
                 )
-                messages = MODULE.normalize_conversation(
+                messages = DATASET.normalize_conversation(
                     row["conversations"], strict_tool_data=True
                 )
-                tools = MODULE.normalize_tools(row["tools"])
+                tools = DATASET.normalize_tools(row["tools"])
 
                 expected_responses = []
                 for turn in row["conversations"]:
-                    visible = MODULE.THINK.sub("", str(turn.get("value", "")))
-                    raw_responses = MODULE.TOOL_RESPONSE.findall(visible)
+                    visible = DATASET.THINK.sub("", str(turn.get("value", "")))
+                    raw_responses = DATASET.TOOL_RESPONSE.findall(visible)
                     if turn["from"] == "tool" and not raw_responses:
                         raw_responses = [visible]
                     for raw_response in raw_responses:
-                        response = MODULE.parse_response(raw_response)
+                        response = DATASET.parse_response(raw_response)
                         if turn["from"] == "tool" or response.get(
                             "name"
                         ) or response.get("tool_call_id"):
@@ -202,7 +209,7 @@ class Tests(unittest.TestCase):
                 )
 
     def test_tool_schema_normalization(self):
-        tools = MODULE.normalize_tools(
+        tools = DATASET.normalize_tools(
             json.dumps(
                 [
                     {
@@ -222,7 +229,7 @@ class Tests(unittest.TestCase):
         )
 
     def test_conversation_normalization(self):
-        messages = MODULE.normalize_conversation(
+        messages = DATASET.normalize_conversation(
             [
                 {
                     "from": "system",
@@ -275,7 +282,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(messages[3]["content"], "")
 
     def test_response_edge_cases(self):
-        unwrapped = MODULE.normalize_conversation(
+        unwrapped = DATASET.normalize_conversation(
             [
                 {
                     "from": "gpt",
@@ -309,12 +316,12 @@ class Tests(unittest.TestCase):
                 ),
             },
         ]
-        malformed = MODULE.normalize_conversation(malformed_conversation)
+        malformed = DATASET.normalize_conversation(malformed_conversation)
         self.assertEqual(malformed[0]["tool_responses"][0]["name"], "overview")
         self.assertIsInstance(malformed[0]["tool_responses"][0]["response"], str)
-        self.assertFalse(MODULE.has_consistent_tool_data(malformed_conversation))
+        self.assertFalse(DATASET.has_consistent_tool_data(malformed_conversation))
 
-        orphan = MODULE.normalize_conversation(
+        orphan = DATASET.normalize_conversation(
             [{"from": "gpt", "value": "<tool_response>Natural answer</tool_response>"}]
         )
         self.assertEqual(orphan, [{"role": "assistant", "content": "Natural answer"}])
@@ -325,15 +332,15 @@ class Tests(unittest.TestCase):
                 "value": '<tool_call>{"name":"broken","arguments":[}</tool_call>',
             }
         ]
-        invalid_call = MODULE.normalize_conversation(invalid_call_conversation)
+        invalid_call = DATASET.normalize_conversation(invalid_call_conversation)
         self.assertEqual(
             invalid_call,
             [{"role": "assistant", "content": '{"name":"broken","arguments":[}'}],
         )
-        self.assertFalse(MODULE.has_consistent_tool_data(invalid_call_conversation))
+        self.assertFalse(DATASET.has_consistent_tool_data(invalid_call_conversation))
 
     def test_official_template_renders_normalized_data(self):
-        messages = MODULE.normalize_conversation(
+        messages = DATASET.normalize_conversation(
             [
                 {
                     "from": "gpt",
@@ -350,7 +357,7 @@ class Tests(unittest.TestCase):
         )
         rendered = Environment().from_string(TEMPLATE.read_text(encoding="utf-8")).render(
             messages=messages,
-            tools=MODULE.normalize_tools('[{"name":"weather","parameters":{}}]'),
+            tools=DATASET.normalize_tools('[{"name":"weather","parameters":{}}]'),
             bos_token="<bos>",
             add_generation_prompt=False,
             preserve_thinking=True,
@@ -362,6 +369,10 @@ class Tests(unittest.TestCase):
     def test_quantization_contract(self):
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        dataset_tree = ast.parse(DATASET_SCRIPT.read_text(encoding="utf-8"))
+        dataset_calls = [
+            node for node in ast.walk(dataset_tree) if isinstance(node, ast.Call)
+        ]
 
         def call_named(name):
             return next(
@@ -370,6 +381,22 @@ class Tests(unittest.TestCase):
                 if (isinstance(call.func, ast.Name) and call.func.id == name)
                 or (isinstance(call.func, ast.Attribute) and call.func.attr == name)
             )
+
+        dataset_import = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "calibration_dataset"
+        )
+        self.assertEqual(
+            [alias.name for alias in dataset_import.names],
+            ["create_calibration_dataset"],
+        )
+        dataset_builder = call_named("create_calibration_dataset")
+        self.assertEqual(
+            [ast.unparse(argument) for argument in dataset_builder.args],
+            ["tokenizer"],
+        )
 
         model_load = next(
             call
@@ -384,7 +411,7 @@ class Tests(unittest.TestCase):
 
         template_calls = [
             call
-            for call in calls
+            for call in dataset_calls
             if isinstance(call.func, ast.Attribute)
             and call.func.attr == "apply_chat_template"
         ]
