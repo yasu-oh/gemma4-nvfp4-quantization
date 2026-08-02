@@ -33,18 +33,6 @@ class InvalidToolDataError(ValueError):
     pass
 
 
-class UnmatchedToolResponseError(InvalidToolDataError):
-    pass
-
-
-class InvalidToolCallError(InvalidToolDataError):
-    pass
-
-
-class InvalidToolResponseError(InvalidToolDataError):
-    pass
-
-
 def parse(value: Any) -> Any:
     if not isinstance(value, str):
         return value
@@ -117,7 +105,7 @@ def parse_assistant(
                 raise ValueError
         except (AttributeError, KeyError, SyntaxError, TypeError, ValueError):
             if reject_invalid_calls:
-                raise InvalidToolCallError(raw_call)
+                raise InvalidToolDataError(raw_call)
             invalid_calls.append(raw_call.strip())
             continue
         calls.append(
@@ -153,7 +141,7 @@ def parse_response(
         response = parse(payload)
     except (SyntaxError, ValueError):
         if reject_invalid:
-            raise InvalidToolResponseError(value)
+            raise InvalidToolDataError(value)
         return {
             "content": value,
             "name": extract_string(value, "name"),
@@ -261,7 +249,7 @@ def normalize_conversation(
                     if strict_tool_data and (
                         response.get("name") or response.get("tool_call_id")
                     ):
-                        raise UnmatchedToolResponseError(raw_response)
+                        raise InvalidToolDataError(raw_response)
                     fallback = str(response.get("content") or "").strip("* \n")
                     assistant["content"] = "\n\n".join(
                         part
@@ -275,7 +263,7 @@ def normalize_conversation(
                 )
                 if not attach_response(messages, response):
                     if strict_tool_data:
-                        raise UnmatchedToolResponseError(raw_response)
+                        raise InvalidToolDataError(raw_response)
         else:
             raise ValueError(f"Unsupported role: {role}")
     return messages
@@ -339,10 +327,9 @@ def create_calibration_dataset(tokenizer: Any) -> Any:
             )
         }
 
-    calibration_dataset = concatenate_datasets(
+    return concatenate_datasets(
         [
             aya.map(format_aya, remove_columns=aya.column_names),
             hermes.map(format_hermes, remove_columns=hermes.column_names),
         ]
     ).shuffle(seed=SEED)
-    return calibration_dataset

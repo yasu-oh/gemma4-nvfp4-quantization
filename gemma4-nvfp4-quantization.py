@@ -33,7 +33,7 @@ def apply_chat_template_file(
 def main() -> None:
     from compressed_tensors.quantization import QuantizationArgs, preset_name_to_scheme
     from llmcompressor import oneshot
-    from llmcompressor.modifiers.quantization import GPTQModifier
+    from llmcompressor.modifiers.gptq import GPTQModifier
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     work_dir = Path.cwd()

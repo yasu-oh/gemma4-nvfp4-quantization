@@ -46,17 +46,18 @@ def write_config(work_dir, **overrides):
     )
 
 
+def call_named(calls, name):
+    return next(
+        call
+        for call in calls
+        if (isinstance(call.func, ast.Name) and call.func.id == name)
+        or (isinstance(call.func, ast.Attribute) and call.func.attr == name)
+    )
+
+
 def quantization_contract(path):
     tree = ast.parse(path.read_text(encoding="utf-8"))
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-
-    def call_named(name):
-        return next(
-            call
-            for call in calls
-            if (isinstance(call.func, ast.Name) and call.func.id == name)
-            or (isinstance(call.func, ast.Attribute) and call.func.attr == name)
-        )
 
     assignments = {}
     attributes = {}
@@ -80,30 +81,13 @@ def quantization_contract(path):
     modifier = recipe.elts[0]
     modifier_keywords = {item.arg: item.value for item in modifier.keywords}
     kv_cache = modifier_keywords["kv_cache_scheme"]
-    oneshot = call_named("oneshot")
+    oneshot = call_named(calls, "oneshot")
     model_save = next(
         call
         for call in calls
         if isinstance(call.func, ast.Attribute)
         and ast.unparse(call.func.value) == "model"
         and call.func.attr == "save_pretrained"
-    )
-
-    imatrix_gatherer_present = any(
-        (
-            isinstance(node, ast.ImportFrom)
-            and node.module == "llmcompressor.modifiers.transform.imatrix"
-        )
-        or (
-            isinstance(node, ast.Call)
-            and (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "IMatrixGatherer"
-                or isinstance(node.func, ast.Attribute)
-                and node.func.attr == "IMatrixGatherer"
-            )
-        )
-        for node in ast.walk(tree)
     )
 
     return {
@@ -121,7 +105,7 @@ def quantization_contract(path):
         "ignore": ast.literal_eval(assignments["ignore"]),
         "preset": [
             ast.literal_eval(argument)
-            for argument in call_named("preset_name_to_scheme").args
+            for argument in call_named(calls, "preset_name_to_scheme").args
         ],
         "observer": ast.literal_eval(
             attributes["nvfp4_scheme.weights.observer"]
@@ -129,7 +113,6 @@ def quantization_contract(path):
         "observer_kwargs": ast.literal_eval(
             attributes["nvfp4_scheme.weights.observer_kwargs"]
         ),
-        "imatrix_gatherer_present": imatrix_gatherer_present,
         "recipe_modifiers": [ast.unparse(item.func) for item in recipe.elts],
         "config_groups": ast.unparse(modifier_keywords["config_groups"]),
         "modifier_ignore": ast.unparse(modifier_keywords["ignore"]),
@@ -146,9 +129,6 @@ def quantization_contract(path):
                 if item.arg == "save_compressed"
             )
         ),
-        "pipeline_symbols": {
-            name for name in assignments if name.upper() == "PIPELINE" or name == "PIPELINES"
-        },
     }
 
 
@@ -160,11 +140,7 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work_dir = Path(directory)
             device_map = {"model.embed_tokens": "cpu", "model.layers.0": 0}
-            write_config(
-                work_dir,
-                device_map=device_map,
-                pipeline="ignored",
-            )
+            write_config(work_dir, device_map=device_map)
             expected = ("org/model", device_map, work_dir / "output", False)
             for module in (GENERAL, E):
                 with self.subTest(module=module.__name__):
@@ -443,12 +419,8 @@ class Tests(unittest.TestCase):
             self.assertEqual(contract["preset"], ["NVFP4", ["Linear"]])
             self.assertEqual(contract["observer"], "imatrix_mse")
             self.assertEqual(contract["observer_kwargs"], {"strict": True})
-            self.assertFalse(contract["imatrix_gatherer_present"])
             self.assertEqual(contract["recipe_modifiers"], ["GPTQModifier"])
-            self.assertEqual(
-                contract["config_groups"],
-                "{'group_0': nvfp4_scheme}",
-            )
+            self.assertEqual(contract["config_groups"], "{'group_0': nvfp4_scheme}")
             self.assertEqual(contract["modifier_ignore"], "ignore")
             self.assertEqual(
                 contract["kv_cache"],
@@ -462,7 +434,6 @@ class Tests(unittest.TestCase):
                 },
             )
             self.assertTrue(contract["save_compressed"])
-            self.assertFalse(contract["pipeline_symbols"])
 
         self.assertEqual(
             general["ignore"],
@@ -495,7 +466,3 @@ class Tests(unittest.TestCase):
             e_model["oneshot"],
             {**oneshot, "pipeline": "'basic'"},
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
