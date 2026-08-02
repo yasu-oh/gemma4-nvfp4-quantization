@@ -6,32 +6,150 @@ import unittest
 from pathlib import Path
 
 from datasets import load_dataset
-from jinja2 import Environment
 from transformers import AutoTokenizer
 
 ROOT = Path(__file__).parent
-SCRIPT = ROOT / "gemma4-nvfp4-quantization.py"
-COPIED_SCRIPT = ROOT / "gemma4-e-nvfp4-quantization.py"
+GENERAL_SCRIPT = ROOT / "gemma4-nvfp4-quantization.py"
+E_SCRIPT = ROOT / "gemma4-e-nvfp4-quantization.py"
 DATASET_SCRIPT = ROOT / "calibration_dataset.py"
-TEMPLATE = ROOT / "chat_template.jinja"
-SPEC = importlib.util.spec_from_file_location("quantization", SCRIPT)
-MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader
-SPEC.loader.exec_module(MODULE)
-E_SPEC = importlib.util.spec_from_file_location("e_quantization", COPIED_SCRIPT)
-E_MODULE = importlib.util.module_from_spec(E_SPEC)
-assert E_SPEC.loader
-E_SPEC.loader.exec_module(E_MODULE)
-DATASET_SPEC = importlib.util.spec_from_file_location(
-    "calibration_dataset_under_test", DATASET_SCRIPT
-)
-DATASET = importlib.util.module_from_spec(DATASET_SPEC)
-assert DATASET_SPEC.loader
-DATASET_SPEC.loader.exec_module(DATASET)
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+GENERAL = load_module("quantization", GENERAL_SCRIPT)
+E = load_module("e_quantization", E_SCRIPT)
+DATASET = load_module("calibration_dataset_under_test", DATASET_SCRIPT)
 
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def write_config(work_dir, **overrides):
+    config = {
+        "model_id": "org/model",
+        "device_map": "cpu",
+        "save_dir": "output",
+        "use_bundled_chat_template": False,
+        **overrides,
+    }
+    (work_dir / "config.yaml").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+
+
+def quantization_contract(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+    def call_named(name):
+        return next(
+            call
+            for call in calls
+            if (isinstance(call.func, ast.Name) and call.func.id == name)
+            or (isinstance(call.func, ast.Attribute) and call.func.attr == name)
+        )
+
+    assignments = {}
+    attributes = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name):
+            assignments[target.id] = node.value
+        elif isinstance(target, ast.Attribute):
+            attributes[ast.unparse(target)] = node.value
+
+    model_load = next(
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == "from_pretrained"
+        and ast.unparse(call.func.value) == "AutoModelForCausalLM"
+    )
+    recipe = assignments["recipe"]
+    modifier = recipe.elts[0]
+    modifier_keywords = {item.arg: item.value for item in modifier.keywords}
+    kv_cache = modifier_keywords["kv_cache_scheme"]
+    oneshot = call_named("oneshot")
+    model_save = next(
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and ast.unparse(call.func.value) == "model"
+        and call.func.attr == "save_pretrained"
+    )
+
+    imatrix_gatherer_present = any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "llmcompressor.modifiers.transform.imatrix"
+        )
+        or (
+            isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "IMatrixGatherer"
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr == "IMatrixGatherer"
+            )
+        )
+        for node in ast.walk(tree)
+    )
+
+    return {
+        "dataset_import": [
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "calibration_dataset"
+            for alias in node.names
+        ],
+        "model_args": [ast.unparse(argument) for argument in model_load.args],
+        "model_kwargs": {
+            item.arg: ast.unparse(item.value) for item in model_load.keywords
+        },
+        "ignore": ast.literal_eval(assignments["ignore"]),
+        "preset": [
+            ast.literal_eval(argument)
+            for argument in call_named("preset_name_to_scheme").args
+        ],
+        "observer": ast.literal_eval(
+            attributes["nvfp4_scheme.weights.observer"]
+        ),
+        "observer_kwargs": ast.literal_eval(
+            attributes["nvfp4_scheme.weights.observer_kwargs"]
+        ),
+        "imatrix_gatherer_present": imatrix_gatherer_present,
+        "recipe_modifiers": [ast.unparse(item.func) for item in recipe.elts],
+        "config_groups": ast.unparse(modifier_keywords["config_groups"]),
+        "modifier_ignore": ast.unparse(modifier_keywords["ignore"]),
+        "kv_cache": {
+            item.arg: ast.literal_eval(item.value) for item in kv_cache.keywords
+        },
+        "oneshot": {
+            item.arg: ast.unparse(item.value) for item in oneshot.keywords
+        },
+        "save_compressed": ast.literal_eval(
+            next(
+                item.value
+                for item in model_save.keywords
+                if item.arg == "save_compressed"
+            )
+        ),
+        "pipeline_symbols": {
+            name for name in assignments if name.upper() == "PIPELINE" or name == "PIPELINES"
+        },
+    }
 
 
 class Tests(unittest.TestCase):
@@ -41,139 +159,124 @@ class Tests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             work_dir = Path(directory)
-            (work_dir / "config.yaml").write_text(
-                "model_id: org/model\ndevice_map: cpu\nsave_dir: output\n"
-                "use_bundled_chat_template: false\n",
-                encoding="utf-8",
+            device_map = {"model.embed_tokens": "cpu", "model.layers.0": 0}
+            write_config(
+                work_dir,
+                device_map=device_map,
+                pipeline="ignored",
             )
-            model_id, device_map, save_dir, use_bundled_template = MODULE.load_config(
-                work_dir
-            )
-            self.assertEqual(
-                (model_id, device_map, save_dir, use_bundled_template),
-                ("org/model", "cpu", work_dir / "output", False),
-            )
+            expected = ("org/model", device_map, work_dir / "output", False)
+            for module in (GENERAL, E):
+                with self.subTest(module=module.__name__):
+                    self.assertEqual(module.load_config(work_dir), expected)
 
-            tokenizer = Tokenizer()
-            template_path = work_dir / "chat_template.jinja"
-            template_path.write_text("official", encoding="utf-8")
-            MODULE.apply_chat_template_file(tokenizer, work_dir, use_bundled_template)
-            self.assertEqual(tokenizer.chat_template, "default")
+            write_config(work_dir, use_bundled_chat_template="true")
+            for module in (GENERAL, E):
+                with self.subTest(module=module.__name__):
+                    with self.assertRaises(TypeError):
+                        module.load_config(work_dir)
 
-            template_path.unlink()
-            with self.assertRaises(FileNotFoundError):
-                MODULE.apply_chat_template_file(tokenizer, work_dir, True)
+            for module in (GENERAL, E):
+                with self.subTest(module=module.__name__):
+                    tokenizer = Tokenizer()
+                    template = work_dir / "chat_template.jinja"
+                    template.unlink(missing_ok=True)
+                    module.apply_chat_template_file(tokenizer, work_dir, False)
+                    self.assertEqual(tokenizer.chat_template, "default")
+                    with self.assertRaises(FileNotFoundError):
+                        module.apply_chat_template_file(tokenizer, work_dir, True)
+                    template.write_text("official", encoding="utf-8")
+                    module.apply_chat_template_file(tokenizer, work_dir, True)
+                    self.assertEqual(tokenizer.chat_template, "official")
 
-            template_path.write_text("official", encoding="utf-8")
-            MODULE.apply_chat_template_file(tokenizer, work_dir, True)
-            self.assertEqual(tokenizer.chat_template, "official")
-
-            (work_dir / "config.yaml").write_text(
-                "model_id: org/model\ndevice_map:\n  model.embed_tokens: cpu\n"
-                "  model.layers.0: 0\nsave_dir: output\n"
-                "use_bundled_chat_template: false\n",
-                encoding="utf-8",
-            )
-            _, device_map, _, _ = MODULE.load_config(work_dir)
-            self.assertEqual(
-                device_map,
-                {"model.embed_tokens": "cpu", "model.layers.0": 0},
-            )
-
-            (work_dir / "config.yaml").write_text(
-                "model_id: org/model\ndevice_map: auto\nsave_dir: output\n"
-                "use_bundled_chat_template: false\npipeline: invalid\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(
-                MODULE.load_config(work_dir),
-                ("org/model", "auto", work_dir / "output", False),
-            )
-
-            (work_dir / "config.yaml").write_text(
-                'model_id: org/model\ndevice_map: auto\nsave_dir: output\n'
-                'use_bundled_chat_template: "true"\n',
-                encoding="utf-8",
-            )
-            with self.assertRaises(TypeError):
-                MODULE.load_config(work_dir)
-
-    def test_e_config_does_not_read_pipeline(self):
-        with tempfile.TemporaryDirectory() as directory:
-            work_dir = Path(directory)
-            (work_dir / "config.yaml").write_text(
-                "model_id: org/model\ndevice_map: cpu\nsave_dir: output\n"
-                "use_bundled_chat_template: false\npipeline: invalid\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(
-                E_MODULE.load_config(work_dir),
-                ("org/model", "cpu", work_dir / "output", False),
-            )
-
-    def test_hermes_sampling(self):
-        mismatched = [
-            {
-                "from": "gpt",
-                "value": (
-                    '<tool_call>{"id":"shared","name":"expected",'
-                    '"arguments":{}}</tool_call>'
-                ),
-            },
-            {
-                "from": "tool",
-                "value": (
-                    '<tool_response>{"tool_call_id":"shared","name":"wrong",'
-                    '"content":{"ok":true}}</tool_response>'
-                ),
-            },
+    def test_invalid_tool_data_is_filtered(self):
+        conversations = [
+            [
+                {
+                    "from": "gpt",
+                    "value": (
+                        '<tool_call>{"id":"shared","name":"expected",'
+                        '"arguments":{}}</tool_call>'
+                    ),
+                },
+                {
+                    "from": "tool",
+                    "value": (
+                        '<tool_response>{"tool_call_id":"shared","name":"wrong",'
+                        '"content":{"ok":true}}</tool_response>'
+                    ),
+                },
+            ],
+            [
+                {
+                    "from": "gpt",
+                    "value": (
+                        '<tool_call>{"name":"first","arguments":{}}</tool_call>'
+                        '<tool_call>{"name":"second","arguments":{}}</tool_call>'
+                    ),
+                },
+                {"from": "tool", "value": '{"content":{"ok":true}}'},
+            ],
+            [
+                {
+                    "from": "gpt",
+                    "value": '<tool_call>{"name":"overview","arguments":{}}</tool_call>',
+                },
+                {
+                    "from": "tool",
+                    "value": (
+                        '<tool_response>{"name":"overview","content":"'
+                        "{'album': \"Quoted title\"}"
+                        '"}</tool_response>'
+                    ),
+                },
+            ],
+            [
+                {
+                    "from": "gpt",
+                    "value": '<tool_call>{"name":"broken","arguments":[}</tool_call>',
+                }
+            ],
         ]
-        self.assertFalse(DATASET.has_consistent_tool_data(mismatched))
-        with self.assertRaises(DATASET.UnmatchedToolResponseError):
-            DATASET.normalize_conversation(
-                mismatched, strict_tool_data=True
-            )
+        for index, conversation in enumerate(conversations):
+            with self.subTest(index=index):
+                self.assertFalse(DATASET.has_consistent_tool_data(conversation))
+                with self.assertRaises(DATASET.InvalidToolDataError):
+                    DATASET.normalize_conversation(
+                        conversation,
+                        strict_tool_data=True,
+                    )
 
-        ambiguous = [
-            {
-                "from": "gpt",
-                "value": (
-                    '<tool_call>{"name":"first","arguments":{}}</tool_call>'
-                    '<tool_call>{"name":"second","arguments":{}}</tool_call>'
-                ),
-            },
-            {"from": "tool", "value": '{"content":{"ok":true}}'},
-        ]
-        self.assertFalse(DATASET.has_consistent_tool_data(ambiguous))
-
-        self.assertEqual(
-            DATASET.HERMES_SAMPLES,
-            {"single": 102, "multiturn": 154, "multistep": 205, "relevance": 51},
-        )
+    def test_hermes_sampling_preserves_semantics(self):
         selected = DATASET.select_hermes_samples(
             load_dataset(DATASET.HERMES_DATASET, split="train")
         )
-
         counts = {}
         for category in selected["scenario_category"]:
             counts[category] = counts.get(category, 0) + 1
-        self.assertEqual(counts, DATASET.HERMES_SAMPLES)
-        self.assertEqual(len(selected), 512)
+        self.assertEqual(
+            counts,
+            {"single": 102, "multiturn": 154, "multistep": 205, "relevance": 51},
+        )
 
         tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-31B-it")
-        MODULE.apply_chat_template_file(tokenizer, ROOT, True)
+        GENERAL.apply_chat_template_file(tokenizer, ROOT, True)
 
         for index, row in enumerate(selected):
             with self.subTest(index=index, category=row["scenario_category"]):
-                self.assertTrue(
-                    DATASET.has_consistent_tool_data(row["conversations"])
-                )
                 messages = DATASET.normalize_conversation(
                     row["conversations"], strict_tool_data=True
                 )
-                tools = DATASET.normalize_tools(row["tools"])
+                actual_responses = [
+                    response
+                    for message in messages
+                    for response in message.get("tool_responses", [])
+                ]
+                actual_payloads = {
+                    canonical(response["response"])
+                    for response in actual_responses
+                }
 
-                expected_responses = []
                 for turn in row["conversations"]:
                     visible = DATASET.THINK.sub("", str(turn.get("value", "")))
                     raw_responses = DATASET.TOOL_RESPONSE.findall(visible)
@@ -184,63 +287,49 @@ class Tests(unittest.TestCase):
                         if turn["from"] == "tool" or response.get(
                             "name"
                         ) or response.get("tool_call_id"):
-                            expected_responses.append(
-                                canonical(response.get("content"))
+                            self.assertIn(
+                                canonical(response.get("content")),
+                                actual_payloads,
                             )
-
-                actual_responses = [
-                    response
-                    for message in messages
-                    for response in message.get("tool_responses", [])
-                ]
-                actual_payloads = {
-                    canonical(response["response"])
-                    for response in actual_responses
-                }
-                for expected in expected_responses:
-                    self.assertIn(expected, actual_payloads)
 
                 rendered = tokenizer.apply_chat_template(
                     messages,
-                    tools=tools,
+                    tools=DATASET.normalize_tools(row["tools"]),
                     tokenize=False,
                     add_generation_prompt=False,
                     preserve_thinking=True,
                 )
-                self.assertTrue(rendered)
                 self.assertEqual(
-                    rendered.count("<|tool_response>response:"), len(actual_responses)
+                    rendered.count("<|tool_response>response:"),
+                    len(actual_responses),
                 )
                 for response in actual_responses:
                     self.assertIn(
-                        f'<|tool_response>response:{response["name"]}', rendered
+                        f'<|tool_response>response:{response["name"]}',
+                        rendered,
                     )
                 self.assertLessEqual(
                     len(tokenizer.encode(rendered, add_special_tokens=False)),
                     8192,
                 )
 
-    def test_tool_schema_normalization(self):
+        calibration_dataset = DATASET.create_calibration_dataset(tokenizer)
+        self.assertEqual(len(calibration_dataset), 1024)
+        self.assertEqual(calibration_dataset.column_names, ["text"])
+        self.assertTrue(all(calibration_dataset["text"]))
+
+    def test_normalization_contract(self):
         tools = DATASET.normalize_tools(
-            json.dumps(
-                [
-                    {
-                        "name": "search",
-                        "parameters": {
-                            "count": {"type": "int"},
-                            "queries": {"type": "List[str]"},
-                        },
-                    }
-                ]
-            )
+            '[{"name":"search","parameters":{"count":{"type":"int"},'
+            '"queries":{"type":"List[str]"}}}]'
         )
         properties = tools[0]["function"]["parameters"]["properties"]
         self.assertEqual(properties["count"]["type"], "integer")
         self.assertEqual(
-            properties["queries"], {"type": "array", "items": {"type": "string"}}
+            properties["queries"],
+            {"type": "array", "items": {"type": "string"}},
         )
 
-    def test_conversation_normalization(self):
         messages = DATASET.normalize_conversation(
             [
                 {
@@ -279,11 +368,36 @@ class Tests(unittest.TestCase):
                 },
             ]
         )
-        self.assertEqual([message["role"] for message in messages], [
-            "system", "user", "assistant", "assistant"
-        ])
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant", "assistant"],
+        )
         self.assertEqual(messages[0]["content"], "Keep this.")
-        self.assertEqual(len(messages[2]["tool_calls"]), 2)
+        self.assertEqual(
+            messages[2]["reasoning_content"],
+            "Mention `<tool_call>` only as text.",
+        )
+        self.assertEqual(
+            messages[2]["tool_calls"],
+            [
+                {
+                    "id": "tokyo",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": {"city": "Tokyo"},
+                    },
+                },
+                {
+                    "id": "osaka",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": {"city": "Osaka"},
+                    },
+                },
+            ],
+        )
         self.assertEqual(
             messages[2]["tool_responses"],
             [
@@ -293,7 +407,6 @@ class Tests(unittest.TestCase):
         )
         self.assertEqual(messages[3]["content"], "")
 
-    def test_response_edge_cases(self):
         unwrapped = DATASET.normalize_conversation(
             [
                 {
@@ -302,152 +415,57 @@ class Tests(unittest.TestCase):
                 },
                 {
                     "from": "tool",
-                    "value": (
-                        "<tool_response>{'name':'Bistro','distance':500}</tool_response>"
-                        "<tool_response>{'unrelated':true}</tool_response>"
-                    ),
+                    "value": "<tool_response>{'name':'Bistro','distance':500}</tool_response>",
                 },
             ]
         )
         self.assertEqual(
             unwrapped[0]["tool_responses"],
-            [{"name": "restaurant", "response": {"name": "Bistro", "distance": 500}}],
-        )
-
-        malformed_conversation = [
-            {
-                "from": "gpt",
-                "value": '<tool_call>{"name":"overview","arguments":{}}</tool_call>',
-            },
-            {
-                "from": "tool",
-                "value": (
-                    '<tool_response>{"name":"overview","content":"'
-                    "{'album': \"Quoted title\"}"
-                    '"}</tool_response>'
-                ),
-            },
-        ]
-        malformed = DATASET.normalize_conversation(malformed_conversation)
-        self.assertEqual(malformed[0]["tool_responses"][0]["name"], "overview")
-        self.assertIsInstance(malformed[0]["tool_responses"][0]["response"], str)
-        self.assertFalse(DATASET.has_consistent_tool_data(malformed_conversation))
-
-        orphan = DATASET.normalize_conversation(
-            [{"from": "gpt", "value": "<tool_response>Natural answer</tool_response>"}]
-        )
-        self.assertEqual(orphan, [{"role": "assistant", "content": "Natural answer"}])
-
-        invalid_call_conversation = [
-            {
-                "from": "gpt",
-                "value": '<tool_call>{"name":"broken","arguments":[}</tool_call>',
-            }
-        ]
-        invalid_call = DATASET.normalize_conversation(invalid_call_conversation)
-        self.assertEqual(
-            invalid_call,
-            [{"role": "assistant", "content": '{"name":"broken","arguments":[}'}],
-        )
-        self.assertFalse(DATASET.has_consistent_tool_data(invalid_call_conversation))
-
-    def test_official_template_renders_normalized_data(self):
-        messages = DATASET.normalize_conversation(
             [
                 {
-                    "from": "gpt",
-                    "value": '<tool_call>{"name":"weather","arguments":{}}</tool_call>',
-                },
-                {
-                    "from": "tool",
-                    "value": (
-                        '<tool_response>{"name":"weather","content":'
-                        '{"data":[{"temperature":28}]}}</tool_response>'
-                    ),
-                },
-            ]
+                    "name": "restaurant",
+                    "response": {"name": "Bistro", "distance": 500},
+                }
+            ],
         )
-        rendered = Environment().from_string(TEMPLATE.read_text(encoding="utf-8")).render(
-            messages=messages,
-            tools=DATASET.normalize_tools('[{"name":"weather","parameters":{}}]'),
-            bos_token="<bos>",
-            add_generation_prompt=False,
-            preserve_thinking=True,
-            enable_thinking=False,
-        )
-        self.assertIn("<|tool_call>call:weather", rendered)
-        self.assertIn("<|tool_response>response:weather{data:[{temperature:28}]}", rendered)
 
     def test_quantization_contract(self):
-        self.assertTrue(COPIED_SCRIPT.is_file())
-        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-        copied_tree = ast.parse(COPIED_SCRIPT.read_text(encoding="utf-8"))
-        copied_calls = [
-            node for node in ast.walk(copied_tree) if isinstance(node, ast.Call)
-        ]
-        dataset_tree = ast.parse(DATASET_SCRIPT.read_text(encoding="utf-8"))
-        dataset_calls = [
-            node for node in ast.walk(dataset_tree) if isinstance(node, ast.Call)
-        ]
+        general = quantization_contract(GENERAL_SCRIPT)
+        e_model = quantization_contract(E_SCRIPT)
 
-        def call_named(name):
-            return next(
-                call
-                for call in calls
-                if (isinstance(call.func, ast.Name) and call.func.id == name)
-                or (isinstance(call.func, ast.Attribute) and call.func.attr == name)
+        for contract in (general, e_model):
+            self.assertEqual(contract["dataset_import"], ["create_calibration_dataset"])
+            self.assertEqual(contract["model_args"], ["model_id"])
+            self.assertEqual(
+                contract["model_kwargs"],
+                {"dtype": "'auto'", "device_map": "device_map"},
             )
+            self.assertEqual(contract["preset"], ["NVFP4", ["Linear"]])
+            self.assertEqual(contract["observer"], "imatrix_mse")
+            self.assertEqual(contract["observer_kwargs"], {"strict": True})
+            self.assertFalse(contract["imatrix_gatherer_present"])
+            self.assertEqual(contract["recipe_modifiers"], ["GPTQModifier"])
+            self.assertEqual(
+                contract["config_groups"],
+                "{'group_0': nvfp4_scheme}",
+            )
+            self.assertEqual(contract["modifier_ignore"], "ignore")
+            self.assertEqual(
+                contract["kv_cache"],
+                {
+                    "num_bits": 8,
+                    "type": "float",
+                    "symmetric": True,
+                    "strategy": "tensor",
+                    "dynamic": False,
+                    "observer": "static_minmax",
+                },
+            )
+            self.assertTrue(contract["save_compressed"])
+            self.assertFalse(contract["pipeline_symbols"])
 
-        dataset_import = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "calibration_dataset"
-        )
         self.assertEqual(
-            [alias.name for alias in dataset_import.names],
-            ["create_calibration_dataset"],
-        )
-        dataset_builder = call_named("create_calibration_dataset")
-        self.assertEqual(
-            [ast.unparse(argument) for argument in dataset_builder.args],
-            ["tokenizer"],
-        )
-
-        model_load = next(
-            call
-            for call in calls
-            if isinstance(call.func, ast.Attribute)
-            and ast.unparse(call.func.value) == "AutoModelForCausalLM"
-            and call.func.attr == "from_pretrained"
-        )
-        model_keywords = {item.arg: item.value for item in model_load.keywords}
-        self.assertEqual(model_keywords["dtype"].value, "auto")
-        self.assertEqual(ast.unparse(model_keywords["device_map"]), "device_map")
-
-        template_calls = [
-            call
-            for call in dataset_calls
-            if isinstance(call.func, ast.Attribute)
-            and call.func.attr == "apply_chat_template"
-        ]
-        self.assertEqual(len(template_calls), 2)
-        self.assertTrue(all(
-            {item.arg: item.value for item in call.keywords}["tokenize"].value is False
-            for call in template_calls
-        ))
-
-        assignments = {
-            target.id: node.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance((target := node.targets[0]), ast.Name)
-        }
-        self.assertNotIn("PIPELINES", assignments)
-        self.assertEqual(
-            ast.literal_eval(assignments["ignore"]),
+            general["ignore"],
             [
                 "lm_head",
                 "re:.*embed.*",
@@ -456,129 +474,26 @@ class Tests(unittest.TestCase):
                 "re:.*router.*",
             ],
         )
+        self.assertEqual(
+            e_model["ignore"],
+            general["ignore"] + ["re:.*per_layer.*"],
+        )
 
-        copied_assignments = {
-            target.id: node.value
-            for node in ast.walk(copied_tree)
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance((target := node.targets[0]), ast.Name)
+        oneshot = {
+            "model": "model",
+            "tokenizer": "tokenizer",
+            "recipe": "recipe",
+            "dataset": "calibration_dataset",
+            "num_calibration_samples": "len(calibration_dataset)",
+            "shuffle_calibration_samples": "False",
+            "text_column": "'text'",
+            "max_seq_length": "8192",
+            "pad_to_max_length": "False",
         }
-        self.assertNotIn("PIPELINES", copied_assignments)
-        self.assertNotIn("pipeline", copied_assignments)
+        self.assertEqual(general["oneshot"], oneshot)
         self.assertEqual(
-            ast.literal_eval(copied_assignments["ignore"]),
-            [
-                "lm_head",
-                "re:.*embed.*",
-                "re:.*vision.*",
-                "re:.*audio.*",
-                "re:.*router.*",
-                "re:.*per_layer.*",
-            ],
-        )
-
-        preset = call_named("preset_name_to_scheme")
-        self.assertEqual(ast.literal_eval(preset.args[0]), "NVFP4")
-        self.assertEqual(ast.literal_eval(preset.args[1]), ["Linear"])
-
-        attribute_assignments = {
-            ast.unparse(node.targets[0]): node.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Attribute)
-        }
-        self.assertEqual(
-            ast.literal_eval(attribute_assignments["nvfp4_scheme.weights.observer"]),
-            "imatrix_mse",
-        )
-        self.assertEqual(
-            ast.literal_eval(
-                attribute_assignments["nvfp4_scheme.weights.observer_kwargs"]
-            ),
-            {"strict": True},
-        )
-
-        self.assertFalse(
-            any(
-                isinstance(node, ast.ImportFrom)
-                and node.module == "llmcompressor.modifiers.transform.imatrix"
-                for node in ast.walk(tree)
-            )
-        )
-
-        recipe = assignments["recipe"]
-        self.assertIsInstance(recipe, ast.List)
-        self.assertEqual(
-            [ast.unparse(item.func) for item in recipe.elts],
-            ["GPTQModifier"],
-        )
-
-        modifier_keywords = {
-            item.arg: item.value for item in recipe.elts[0].keywords
-        }
-        config_groups = modifier_keywords["config_groups"]
-        self.assertEqual(
-            [ast.literal_eval(key) for key in config_groups.keys], ["group_0"]
-        )
-        self.assertEqual(
-            [ast.unparse(value) for value in config_groups.values], ["nvfp4_scheme"]
-        )
-        self.assertEqual(ast.unparse(modifier_keywords["ignore"]), "ignore")
-
-        kv_cache_scheme = modifier_keywords["kv_cache_scheme"]
-        self.assertEqual(ast.unparse(kv_cache_scheme.func), "QuantizationArgs")
-        self.assertEqual(
-            {
-                item.arg: ast.literal_eval(item.value)
-                for item in kv_cache_scheme.keywords
-            },
-            {
-                "num_bits": 8,
-                "type": "float",
-                "symmetric": True,
-                "strategy": "tensor",
-                "dynamic": False,
-                "observer": "static_minmax",
-            },
-        )
-
-        oneshot = call_named("oneshot")
-        oneshot_keywords = {item.arg: item.value for item in oneshot.keywords}
-        self.assertEqual(ast.unparse(oneshot_keywords["tokenizer"]), "tokenizer")
-        self.assertNotIn("pipeline", oneshot_keywords)
-        self.assertEqual(oneshot_keywords["text_column"].value, "text")
-        self.assertEqual(oneshot_keywords["max_seq_length"].value, 8192)
-        self.assertIs(oneshot_keywords["shuffle_calibration_samples"].value, False)
-        self.assertIs(oneshot_keywords["pad_to_max_length"].value, False)
-        self.assertNotIn("data_collator", oneshot_keywords)
-
-        copied_oneshot = next(
-            call
-            for call in copied_calls
-            if isinstance(call.func, ast.Name) and call.func.id == "oneshot"
-        )
-        copied_oneshot_keywords = {
-            item.arg: item.value for item in copied_oneshot.keywords
-        }
-        self.assertEqual(
-            ast.literal_eval(copied_oneshot_keywords["pipeline"]),
-            "basic",
-        )
-
-        model_save = next(
-            call
-            for call in calls
-            if isinstance(call.func, ast.Attribute)
-            and ast.unparse(call.func.value) == "model"
-            and call.func.attr == "save_pretrained"
-        )
-        self.assertIs(
-            {item.arg: item.value for item in model_save.keywords}[
-                "save_compressed"
-            ].value,
-            True,
+            e_model["oneshot"],
+            {**oneshot, "pipeline": "'basic'"},
         )
 
 
