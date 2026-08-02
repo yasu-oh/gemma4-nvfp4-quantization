@@ -2,4 +2,3 @@ model_id: google/gemma-4-31B-it
 device_map: auto
 save_dir: gemma-4-31B-it-NVFP4
 use_bundled_chat_template: true
-pipeline: sequential

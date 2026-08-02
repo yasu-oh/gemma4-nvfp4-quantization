@@ -15,7 +15,7 @@ Calibration uses 1,024 chat-template-normalized samples:
 
 `use_bundled_chat_template` in `config.yaml` selects the bundled, official Gemma template (`true`) or the model default (`false`). Hermes rows with unmatched tool responses are excluded before stratified sampling, then normalized before rendering.
 
-`pipeline` controls the `llmcompressor.oneshot` calibration pipeline and defaults to `sequential` when omitted. Use `pipeline: basic` for Gemma 4 E2B or E4B models.
+`gemma4-e-nvfp4-quantization.py` is exclusively for Gemma 4 E2B and E4B models.
 
 ## Usage
 ```bash
@@ -27,7 +27,7 @@ cd ~
 git clone https://github.com/yasu-oh/gemma4-nvfp4-quantization.git
 cd gemma4-nvfp4-quantization
 cp sample_config.yaml config.yaml
-# Set model_id, device_map, save_dir, use_bundled_chat_template, and pipeline.
+# Set model_id, device_map, save_dir, and use_bundled_chat_template.
 python gemma4-nvfp4-quantization.py
 ```
 

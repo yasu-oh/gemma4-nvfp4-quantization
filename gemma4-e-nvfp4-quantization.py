@@ -52,6 +52,7 @@ def main() -> None:
         "re:.*vision.*",
         "re:.*audio.*",
         "re:.*router.*",
+        "re:.*per_layer.*",
     ]
 
     nvfp4_scheme = preset_name_to_scheme("NVFP4", ["Linear"])
@@ -82,6 +83,7 @@ def main() -> None:
     oneshot(
         model=model,
         tokenizer=tokenizer,
+        pipeline="basic",
         recipe=recipe,
         dataset=calibration_dataset,
         num_calibration_samples=len(calibration_dataset),

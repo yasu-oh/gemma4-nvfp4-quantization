@@ -11,12 +11,17 @@ from transformers import AutoTokenizer
 
 ROOT = Path(__file__).parent
 SCRIPT = ROOT / "gemma4-nvfp4-quantization.py"
+COPIED_SCRIPT = ROOT / "gemma4-e-nvfp4-quantization.py"
 DATASET_SCRIPT = ROOT / "calibration_dataset.py"
 TEMPLATE = ROOT / "chat_template.jinja"
 SPEC = importlib.util.spec_from_file_location("quantization", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
 SPEC.loader.exec_module(MODULE)
+E_SPEC = importlib.util.spec_from_file_location("e_quantization", COPIED_SCRIPT)
+E_MODULE = importlib.util.module_from_spec(E_SPEC)
+assert E_SPEC.loader
+E_SPEC.loader.exec_module(E_MODULE)
 DATASET_SPEC = importlib.util.spec_from_file_location(
     "calibration_dataset_under_test", DATASET_SCRIPT
 )
@@ -41,12 +46,12 @@ class Tests(unittest.TestCase):
                 "use_bundled_chat_template: false\n",
                 encoding="utf-8",
             )
-            model_id, device_map, save_dir, use_bundled_template, pipeline = (
-                MODULE.load_config(work_dir)
+            model_id, device_map, save_dir, use_bundled_template = MODULE.load_config(
+                work_dir
             )
             self.assertEqual(
-                (model_id, device_map, save_dir, use_bundled_template, pipeline),
-                ("org/model", "cpu", work_dir / "output", False, "sequential"),
+                (model_id, device_map, save_dir, use_bundled_template),
+                ("org/model", "cpu", work_dir / "output", False),
             )
 
             tokenizer = Tokenizer()
@@ -69,27 +74,21 @@ class Tests(unittest.TestCase):
                 "use_bundled_chat_template: false\n",
                 encoding="utf-8",
             )
-            _, device_map, _, _, pipeline = MODULE.load_config(work_dir)
+            _, device_map, _, _ = MODULE.load_config(work_dir)
             self.assertEqual(
                 device_map,
                 {"model.embed_tokens": "cpu", "model.layers.0": 0},
             )
-            self.assertEqual(pipeline, "sequential")
-
-            (work_dir / "config.yaml").write_text(
-                "model_id: org/model\ndevice_map: auto\nsave_dir: output\n"
-                "use_bundled_chat_template: false\npipeline: basic\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(MODULE.load_config(work_dir)[4], "basic")
 
             (work_dir / "config.yaml").write_text(
                 "model_id: org/model\ndevice_map: auto\nsave_dir: output\n"
                 "use_bundled_chat_template: false\npipeline: invalid\n",
                 encoding="utf-8",
             )
-            with self.assertRaises(ValueError):
-                MODULE.load_config(work_dir)
+            self.assertEqual(
+                MODULE.load_config(work_dir),
+                ("org/model", "auto", work_dir / "output", False),
+            )
 
             (work_dir / "config.yaml").write_text(
                 'model_id: org/model\ndevice_map: auto\nsave_dir: output\n'
@@ -98,6 +97,19 @@ class Tests(unittest.TestCase):
             )
             with self.assertRaises(TypeError):
                 MODULE.load_config(work_dir)
+
+    def test_e_config_does_not_read_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            (work_dir / "config.yaml").write_text(
+                "model_id: org/model\ndevice_map: cpu\nsave_dir: output\n"
+                "use_bundled_chat_template: false\npipeline: invalid\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                E_MODULE.load_config(work_dir),
+                ("org/model", "cpu", work_dir / "output", False),
+            )
 
     def test_hermes_sampling(self):
         mismatched = [
@@ -367,8 +379,13 @@ class Tests(unittest.TestCase):
         self.assertIn("<|tool_response>response:weather{data:[{temperature:28}]}", rendered)
 
     def test_quantization_contract(self):
+        self.assertTrue(COPIED_SCRIPT.is_file())
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        copied_tree = ast.parse(COPIED_SCRIPT.read_text(encoding="utf-8"))
+        copied_calls = [
+            node for node in ast.walk(copied_tree) if isinstance(node, ast.Call)
+        ]
         dataset_tree = ast.parse(DATASET_SCRIPT.read_text(encoding="utf-8"))
         dataset_calls = [
             node for node in ast.walk(dataset_tree) if isinstance(node, ast.Call)
@@ -428,8 +445,29 @@ class Tests(unittest.TestCase):
             and len(node.targets) == 1
             and isinstance((target := node.targets[0]), ast.Name)
         }
+        self.assertNotIn("PIPELINES", assignments)
         self.assertEqual(
             ast.literal_eval(assignments["ignore"]),
+            [
+                "lm_head",
+                "re:.*embed.*",
+                "re:.*vision.*",
+                "re:.*audio.*",
+                "re:.*router.*",
+            ],
+        )
+
+        copied_assignments = {
+            target.id: node.value
+            for node in ast.walk(copied_tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance((target := node.targets[0]), ast.Name)
+        }
+        self.assertNotIn("PIPELINES", copied_assignments)
+        self.assertNotIn("pipeline", copied_assignments)
+        self.assertEqual(
+            ast.literal_eval(copied_assignments["ignore"]),
             [
                 "lm_head",
                 "re:.*embed.*",
@@ -509,12 +547,25 @@ class Tests(unittest.TestCase):
         oneshot = call_named("oneshot")
         oneshot_keywords = {item.arg: item.value for item in oneshot.keywords}
         self.assertEqual(ast.unparse(oneshot_keywords["tokenizer"]), "tokenizer")
-        self.assertEqual(ast.unparse(oneshot_keywords["pipeline"]), "pipeline")
+        self.assertNotIn("pipeline", oneshot_keywords)
         self.assertEqual(oneshot_keywords["text_column"].value, "text")
         self.assertEqual(oneshot_keywords["max_seq_length"].value, 8192)
         self.assertIs(oneshot_keywords["shuffle_calibration_samples"].value, False)
         self.assertIs(oneshot_keywords["pad_to_max_length"].value, False)
         self.assertNotIn("data_collator", oneshot_keywords)
+
+        copied_oneshot = next(
+            call
+            for call in copied_calls
+            if isinstance(call.func, ast.Name) and call.func.id == "oneshot"
+        )
+        copied_oneshot_keywords = {
+            item.arg: item.value for item in copied_oneshot.keywords
+        }
+        self.assertEqual(
+            ast.literal_eval(copied_oneshot_keywords["pipeline"]),
+            "basic",
+        )
 
         model_save = next(
             call
