@@ -110,9 +110,13 @@ def quantization_contract(path):
         "observer": ast.literal_eval(
             attributes["nvfp4_scheme.weights.observer"]
         ),
-        "observer_kwargs": ast.literal_eval(
-            attributes["nvfp4_scheme.weights.observer_kwargs"]
-        ),
+        "observer_kwargs": {
+            ast.literal_eval(key): ast.unparse(value)
+            for key, value in zip(
+                attributes["nvfp4_scheme.weights.observer_kwargs"].keys,
+                attributes["nvfp4_scheme.weights.observer_kwargs"].values,
+            )
+        },
         "recipe_modifiers": [ast.unparse(item.func) for item in recipe.elts],
         "config_groups": ast.unparse(modifier_keywords["config_groups"]),
         "modifier_ignore": ast.unparse(modifier_keywords["ignore"]),
@@ -418,7 +422,16 @@ class Tests(unittest.TestCase):
             )
             self.assertEqual(contract["preset"], ["NVFP4", ["Linear"]])
             self.assertEqual(contract["observer"], "imatrix_mse")
-            self.assertEqual(contract["observer_kwargs"], {"strict": True})
+            self.assertEqual(
+                contract["observer_kwargs"],
+                {
+                    "strict": "True",
+                    "expand": "1.8",
+                    "maxshrink": "1 - 0.8 / 1.8",
+                    "grid": "200.0",
+                    "patience": "1000",
+                },
+            )
             self.assertEqual(contract["recipe_modifiers"], ["GPTQModifier"])
             self.assertEqual(contract["config_groups"], "{'group_0': nvfp4_scheme}")
             self.assertEqual(contract["modifier_ignore"], "ignore")

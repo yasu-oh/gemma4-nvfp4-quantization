@@ -61,7 +61,13 @@ def main() -> None:
         raise RuntimeError("NVFP4 preset does not define weight quantization")
 
     nvfp4_scheme.weights.observer = "imatrix_mse"
-    nvfp4_scheme.weights.observer_kwargs = {"strict": True}
+    nvfp4_scheme.weights.observer_kwargs = {
+        "strict": True,
+        "expand": 1.8,
+        "maxshrink": 1 - 0.8 / 1.8,
+        "grid": 200.0,
+        "patience": 1000,
+    }
 
     recipe = [
         GPTQModifier(
