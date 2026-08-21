@@ -97,7 +97,7 @@ def main() -> None:
         max_seq_length=8192,
         pad_to_max_length=False,
     )
-    model.save_pretrained(save_dir, save_compressed=True)
+    model.save_pretrained(save_dir, save_compressed=True, save_original_format=False)
     tokenizer.save_pretrained(save_dir)
 
 
