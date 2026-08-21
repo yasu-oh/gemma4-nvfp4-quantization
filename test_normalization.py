@@ -429,6 +429,7 @@ class Tests(unittest.TestCase):
                     "expand": "1.8",
                     "maxshrink": "1 - 0.8 / 1.8",
                     "grid": "200.0",
+                    "norm": "2.4",
                     "patience": "1000",
                 },
             )
